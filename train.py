@@ -1,3 +1,7 @@
+import os
+# Скрываем все устройства кроме CUDA device 1
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+
 from collections.abc import Callable
 import json
 from pathlib import Path
@@ -15,7 +19,9 @@ from transformers import (
     PreTrainedTokenizer,
     LlamaForCausalLM,
     GenerationConfig,
+    BitsAndBytesConfig,
 )
+from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 from loss import approx_kl_divergence, GRPOLoss
 from replay_buffer import ReplayBuffer, Experience, join_experience_batch
 
@@ -25,16 +31,44 @@ def load_model(
     trust_remote_code: bool = False,
     bf16: bool = True,
     device_map=None,
+    use_4bit: bool = True,
+    use_lora: bool = True,
 ) -> tuple[LlamaForCausalLM, PreTrainedTokenizer]:
     tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
     tokenizer.pad_token = tokenizer.eos_token
+
+    if use_4bit:
+        quantization_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=torch.bfloat16 if bf16 else torch.float16,
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_quant_type="nf4"
+        )
+    else:
+        quantization_config = None
+
     model = LlamaForCausalLM.from_pretrained(
         model_name_or_path,
         trust_remote_code=trust_remote_code,
         attn_implementation="flash_attention_2",
         torch_dtype=torch.bfloat16 if bf16 else "auto",
         device_map=device_map,
+        quantization_config=quantization_config,
     )
+
+    if use_lora:
+        model = prepare_model_for_kbit_training(model)
+        lora_config = LoraConfig(
+            r=16,
+            lora_alpha=32,
+            target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+            lora_dropout=0.05,
+            bias="none",
+            task_type="CAUSAL_LM"
+        )
+        model = get_peft_model(model, lora_config)
+        model.print_trainable_parameters()
+
     return model, tokenizer
 
 
@@ -195,13 +229,18 @@ def main():
     seed = 42
     wandb_project = None  # "tiny_grpo"
     device_index = 0
-    model_name = "meta-llama/Llama-3.2-1B-Instruct"
+    model_name = "/media/user/My Passport/hfmodels/Llama-3.2-1B-Instruct"
     checkpoint_path = Path("./output")
     checkpoint_interval = 20
     train_batch_size = 16
     lr = 5e-6
     kl_weight = 0.01
     clip_eps = 0.2
+
+    # Добавляем параметры для квантизации и LoRA
+    use_4bit = True
+    use_lora = True
+    bf16 = True
 
     group_size = 12
     rollouts_per_step = 32
@@ -217,8 +256,22 @@ def main():
     cpu_device = torch.device("cpu")
     init_rng(seed)
 
-    reference_model, _ = load_model(model_name, device_map=device)
-    model, tokenizer = load_model(model_name, device_map=device)
+    reference_model, _ = load_model(
+        model_name, 
+        device_map=device,
+        use_4bit=use_4bit,
+        use_lora=use_lora,
+        bf16=bf16
+    )
+    model, tokenizer = load_model(
+        model_name, 
+        device_map=device,
+        use_4bit=use_4bit,
+        use_lora=use_lora,
+        bf16=bf16
+    )
+    
+    # Обновляем оптимизатор для работы только с обучаемыми параметрами
     optimizer = optim.Adam(model.parameters(), lr=lr)
 
     reference_model.eval()
