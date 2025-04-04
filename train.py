@@ -1,7 +1,3 @@
-import os
-# Скрываем все устройства кроме CUDA device 1
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"
-
 from collections.abc import Callable
 import json
 from pathlib import Path
@@ -229,7 +225,7 @@ def main():
     seed = 42
     wandb_project = None  # "tiny_grpo"
     device_index = 0
-    model_name = "/media/user/My Passport/hfmodels/Llama-3.2-1B-Instruct"
+    model_name = "meta-llama/Llama-3.2-1B"
     checkpoint_path = Path("./output")
     checkpoint_interval = 20
     train_batch_size = 16
