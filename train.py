@@ -1,3 +1,7 @@
+import os
+# так можно выбирать устройство для запуска LLM
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+
 from collections.abc import Callable
 import json
 from pathlib import Path
@@ -34,25 +38,45 @@ def load_model(
     tokenizer.pad_token = tokenizer.eos_token
 
     if use_4bit:
+        print("Используется 4-битная квантизация")
         quantization_config = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_compute_dtype=torch.bfloat16 if bf16 else torch.float16,
             bnb_4bit_use_double_quant=True,
-            bnb_4bit_quant_type="nf4"
+            bnb_4bit_quant_type="nf4",
+            llm_int8_skip_modules=["lm_head"]
         )
     else:
-        quantization_config = None
+        print("Используется 8-битная квантизация")
+        quantization_config = BitsAndBytesConfig(
+            load_in_8bit=True,
+            llm_int8_skip_modules=["lm_head"],
+            llm_int8_threshold=6.0,
+            llm_int8_has_fp16_weight=True
+        )
 
     model = LlamaForCausalLM.from_pretrained(
         model_name_or_path,
         trust_remote_code=trust_remote_code,
         attn_implementation="flash_attention_2",
-        torch_dtype=torch.bfloat16 if bf16 else "auto",
+        torch_dtype=None if use_4bit else (torch.bfloat16 if bf16 else "auto"),
         device_map=device_map,
         quantization_config=quantization_config,
     )
 
+    # Проверяем тип параметров модели
+    print("\nПроверка типов параметров модели:")
+    total_size = 0
+    for name, param in model.named_parameters():
+        if "weight" in name:
+            param_size = param.numel() * param.element_size() / 1024**2
+            total_size += param_size
+            print(f"{name}: {param.dtype}, размер: {param_size:.2f} MB")
+    
+    print(f"\nОбщий размер модели: {total_size:.2f} MB")
+
     if use_lora:
+        print("\nПрименяется LoRA")
         model = prepare_model_for_kbit_training(model)
         lora_config = LoraConfig(
             r=16,
@@ -225,7 +249,7 @@ def main():
     seed = 42
     wandb_project = None  # "tiny_grpo"
     device_index = 0
-    model_name = "meta-llama/Llama-3.2-1B"
+    model_name = "unsloth/Llama-3.2-1B-Instruct"
     checkpoint_path = Path("./output")
     checkpoint_interval = 20
     train_batch_size = 16
