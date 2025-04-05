@@ -1,6 +1,6 @@
 import os
 # так можно выбирать устройство для запуска LLM
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+# os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 
 from collections.abc import Callable
 import json
@@ -17,10 +17,11 @@ from torch.utils.data import DataLoader
 from transformers import (
     AutoTokenizer,
     PreTrainedTokenizer,
-    LlamaForCausalLM,
+    AutoModelForCausalLM,
     GenerationConfig,
     BitsAndBytesConfig,
 )
+from bitsandbytes.optim import AdamW32bit, AdamW8bit
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 from loss import approx_kl_divergence, GRPOLoss
 from replay_buffer import ReplayBuffer, Experience, join_experience_batch
@@ -33,7 +34,7 @@ def load_model(
     device_map=None,
     use_4bit: bool = True,
     use_lora: bool = True,
-) -> tuple[LlamaForCausalLM, PreTrainedTokenizer]:
+) -> tuple[AutoModelForCausalLM, PreTrainedTokenizer]:
     tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
     tokenizer.pad_token = tokenizer.eos_token
 
@@ -41,10 +42,9 @@ def load_model(
         print("Используется 4-битная квантизация")
         quantization_config = BitsAndBytesConfig(
             load_in_4bit=True,
-            bnb_4bit_compute_dtype=torch.bfloat16 if bf16 else torch.float16,
-            bnb_4bit_use_double_quant=True,
             bnb_4bit_quant_type="nf4",
-            llm_int8_skip_modules=["lm_head"]
+            bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_use_double_quant=True
         )
     else:
         print("Используется 8-битная квантизация")
@@ -55,11 +55,11 @@ def load_model(
             llm_int8_has_fp16_weight=True
         )
 
-    model = LlamaForCausalLM.from_pretrained(
+    model = AutoModelForCausalLM.from_pretrained(
         model_name_or_path,
-        trust_remote_code=trust_remote_code,
-        attn_implementation="flash_attention_2",
-        torch_dtype=None if use_4bit else (torch.bfloat16 if bf16 else "auto"),
+        # trust_remote_code=trust_remote_code,
+        # attn_implementation="flash_attention_2",
+        # torch_dtype=None if use_4bit else (torch.bfloat16 if bf16 else "auto"),
         device_map=device_map,
         quantization_config=quantization_config,
     )
@@ -81,8 +81,8 @@ def load_model(
         lora_config = LoraConfig(
             r=16,
             lora_alpha=32,
-            target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
-            lora_dropout=0.05,
+            target_modules="all-linear",
+            lora_dropout=0.1,
             bias="none",
             task_type="CAUSAL_LM"
         )
@@ -101,7 +101,7 @@ The assistant first thinks about the reasoning process in the mind and then prov
 
 @torch.no_grad()
 def rollout(
-    model: LlamaForCausalLM,
+    model: AutoModelForCausalLM,
     tokenizer: PreTrainedTokenizer,
     task: str,
     oracle_answer: str,
@@ -204,7 +204,7 @@ def sequence_log_probs_from_logits(
 
 
 def sequences_log_probs(
-    model: LlamaForCausalLM,
+    model: AutoModelForCausalLM,
     sequence_ids: torch.Tensor,
     attention_mask: torch.Tensor,
 ) -> torch.Tensor:
@@ -280,7 +280,7 @@ def main():
         model_name, 
         device_map=device,
         use_4bit=use_4bit,
-        use_lora=use_lora,
+        use_lora=False,
         bf16=bf16
     )
     model, tokenizer = load_model(
@@ -292,12 +292,12 @@ def main():
     )
     
     # Обновляем оптимизатор для работы только с обучаемыми параметрами
-    optimizer = optim.Adam(model.parameters(), lr=lr)
+    optimizer = AdamW32bit(model.parameters(), lr=lr, is_paged=True)
 
     reference_model.eval()
-    model.gradient_checkpointing_enable(
-        gradient_checkpointing_kwargs={"use_reentrant": False}
-    )
+    # model.gradient_checkpointing_enable(
+    #     gradient_checkpointing_kwargs={"use_reentrant": False}
+    # )
 
     pad_token_id = tokenizer.eos_token_id
 
