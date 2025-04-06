@@ -16,13 +16,34 @@ conda activate grpo
 ```
 pip install -r requirements.txt
 pip install flash-attn --no-build-isolation
+pip install accelerate
 ```
 
-3. Play with the source in `train.py`
+3. Play with the source
+
+Run standard training:
 
 ```
 python train.py
 ```
+
+or use the accelerate script:
+
+First, configure accelerate:
+
+```
+accelerate config
+```
+
+Select CPU offloading options when prompted.
+
+Then, launch training:
+
+```
+accelerate launch train_accelerate.py
+```
+
+The `train_accelerate.py` script leverages Hugging Face Accelerate for CPU offloading to optimize memory usage and allow training larger models.
 
 ### Inspiration
 
