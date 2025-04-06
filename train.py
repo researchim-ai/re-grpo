@@ -58,7 +58,7 @@ def load_model(
     model = AutoModelForCausalLM.from_pretrained(
         model_name_or_path,
         # trust_remote_code=trust_remote_code,
-        # attn_implementation="flash_attention_2",
+        attn_implementation="flash_attention_2",
         # torch_dtype=None if use_4bit else (torch.bfloat16 if bf16 else "auto"),
         device_map=device_map,
         quantization_config=quantization_config,
@@ -77,7 +77,7 @@ def load_model(
 
     if use_lora:
         print("\nПрименяется LoRA")
-        model = prepare_model_for_kbit_training(model)
+        model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
         lora_config = LoraConfig(
             r=16,
             lora_alpha=32,
@@ -295,9 +295,9 @@ def main():
     optimizer = AdamW32bit(model.parameters(), lr=lr, is_paged=True)
 
     reference_model.eval()
-    # model.gradient_checkpointing_enable(
-    #     gradient_checkpointing_kwargs={"use_reentrant": False}
-    # )
+    model.gradient_checkpointing_enable(
+        gradient_checkpointing_kwargs={"use_reentrant": False}
+    )
 
     pad_token_id = tokenizer.eos_token_id
 
