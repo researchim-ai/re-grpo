@@ -2,31 +2,28 @@ import os
 # так можно выбирать устройство для запуска LLM
 os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 
-import re
+from collections.abc import Callable
 import json
-import random
 from pathlib import Path
-from typing import Any, Iterator, Optional, Callable
-from collections.abc import Sequence
-
+import random
+import re
+from typing import Any, Iterator, Optional
 import wandb
 import torch
 import torch.optim as optim
 import torch.nn.functional as F
 from torch.nn.utils import clip_grad_norm_
 from torch.utils.data import DataLoader
-
 from transformers import (
     AutoTokenizer,
     PreTrainedTokenizer,
     AutoModelForCausalLM,
     GenerationConfig,
-    BitsAndBytesConfig
+    BitsAndBytesConfig,
 )
-from bitsandbytes.optim import AdamW32bit
+from bitsandbytes.optim import AdamW32bit, AdamW8bit
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
-
-from multiturn_loss import approx_kl_divergence, GRPOLoss
+from loss import approx_kl_divergence, GRPOLoss
 from replay_buffer import ReplayBuffer, Experience, join_experience_batch
 
 
@@ -56,23 +53,11 @@ def calc_tool(expression: str) -> str:
     except Exception as e:
         return f"Calc error: {e}"
 
-@register_tool("echo")
-def echo_tool(message: str) -> str:
-    """
-    Тривиальный пример: просто возвращает 'ECHO: ' + исходное сообщение.
-    """
-    return f"ECHO: {message}"
-
 def detect_and_call_tools(generated_text: str) -> str:
     """
-    Ищет во входном тексте все фрагменты вида <tool_call:имя_инструмента>...</tool_call>.
-    Для каждого вызова:
-      - Определяет имя инструмента (tool_name),
-      - Передаёт содержимое (tool_input) соответствующей функции,
-      - Заменяет вызов в тексте на результат работы инструмента.
-    Возвращает текст, в котором вызовы инструментов заменены на результат.
+    Находит и выполняет все вызовы инструментов в тексте.
     """
-    pattern = r"<tool_call:(\w+)>(.*?)</tool_call>"
+    pattern = r"<tool:(\w+)>(.*?)</tool>"
 
     def _replace_tool_call(match: re.Match) -> str:
         tool_name = match.group(1)
@@ -80,18 +65,13 @@ def detect_and_call_tools(generated_text: str) -> str:
         tool = TOOLS.get(tool_name)
         if tool is None:
             return f"[Tool '{tool_name}' not found]"
-        else:
-            print(f"tool calling: {tool_name}")
         result = tool(tool_input.strip())
-        return result
+        return f"<tool_result>{result}</tool_result>"
 
     updated_text = re.sub(pattern, _replace_tool_call, generated_text, flags=re.DOTALL)
     return updated_text
 
 
-###############################################################################
-# БЛОК С ЗАГРУЗКОЙ МОДЕЛИ
-###############################################################################
 def load_model(
     model_name_or_path: str,
     trust_remote_code: bool = False,
@@ -122,7 +102,9 @@ def load_model(
 
     model = AutoModelForCausalLM.from_pretrained(
         model_name_or_path,
+        # trust_remote_code=trust_remote_code,
         attn_implementation="flash_attention_2",
+        # torch_dtype=None if use_4bit else (torch.bfloat16 if bf16 else "auto"),
         device_map=device_map,
         quantization_config=quantization_config,
     )
@@ -135,7 +117,7 @@ def load_model(
             param_size = param.numel() * param.element_size() / 1024**2
             total_size += param_size
             print(f"{name}: {param.dtype}, размер: {param_size:.2f} MB")
-
+    
     print(f"\nОбщий размер модели: {total_size:.2f} MB")
 
     if use_lora:
@@ -155,69 +137,26 @@ def load_model(
     return model, tokenizer
 
 
-###############################################################################
-# PROMPT (добавляем инструкцию вызывать калькулятор)
-###############################################################################
-system_prompt = """A conversation between User and Assistant. The user asks a question, and the Assistant solves it.
-The assistant first thinks about the reasoning process in the mind and then provides the user with the answer. 
-The reasoning process and answer are enclosed within <think> </think> and <answer> </answer> tags, respectively, i.e., 
-<think> reasoning process here </think>
-<answer> answer here </answer>.
+# DeepSeek Zero system prompt
+system_prompt = """A conversation between User and Assistant. The user asks a question, and the Assistant solves it in two steps.
 
-IMPORTANT: 
-If you need to do any arithmetic or calculation, ALWAYS call:
-    <tool_call:calc>some_expression</tool_call>
-Then wait for the result (it will be injected into your answer), 
-and only after that provide the final <answer> to the user.
+Step 1:
+- Think about the reasoning process and explain it within <reasoning>...</reasoning> tags
+- Call the calculation tool using: <tool:calc>expression</tool>
+- The first response MUST end with a tool call
+
+Step 2:
+- After receiving the tool result, provide the final answer within <answer>...</answer> tags
+- The second response MUST contain only the answer tag
+
+Example:
+User: Calculate 2 + 2
+Assistant: <reasoning>I need to add these numbers together</reasoning>
+<tool:calc>2 + 2</tool>
+System: Tool result: 4
+Assistant: <answer>4</answer>
 """
 
-
-###############################################################################
-# СПИСОК ФУНКЦИЙ НАГРАД (reward_fns) И ИХ СУММАТОР
-###############################################################################
-def reward_for_tool_usage(generated_text: str, tool_name: str = "calc", reward_amount: float = 0.2) -> float:
-    """
-    Если в тексте встречается <tool_call:calc>, даём дополнительную награду 
-    (чтобы модель была мотивирована использовать инструмент).
-    """
-    pattern = rf"<tool_call:{tool_name}>(.*?)</tool_call>"
-    if re.search(pattern, generated_text, flags=re.DOTALL):
-        return reward_amount
-    return 0.0
-
-def reward_for_correct_answer(generated_text: str, oracle_answer: str, correct_reward: float = 1.0, partial_reward: float = 0.5, wrong_reward: float = 0.01) -> float:
-    """
-    Ищем <answer>...</answer> в сгенерированном тексте.
-    Сравниваем со строкой oracle_answer:
-      - Если совпадает по trim(), даём correct_reward,
-      - Если substring, даём partial_reward,
-      - Иначе wrong_reward.
-    """
-    match = re.search(r"<answer>(.*?)</answer>", generated_text, flags=re.DOTALL)
-    if match:
-        ans = match.group(1).strip()
-        if ans == oracle_answer:
-            return correct_reward
-        elif oracle_answer in ans:
-            return partial_reward
-        else:
-            return wrong_reward
-    return 0.0  # Если вообще нет тега <answer> - награда 0
-
-def sum_rewards(text: str, oracle: str, reward_fns: list[Callable[[str, str], float]]) -> float:
-    """
-    Проходимся по списку функций награды, суммируем результат.
-    Каждая функция имеет сигнатуру: fn(generated_text, oracle_answer) -> float
-    """
-    total = 0.0
-    for fn in reward_fns:
-        total += fn(text, oracle)
-    return total
-
-
-###############################################################################
-# ФУНКЦИЯ ROLLOUT, ОБНОВЛЕННАЯ ДЛЯ ВЫЗОВА НАГРАДОК
-###############################################################################
 @torch.no_grad()
 def rollout(
     model: AutoModelForCausalLM,
@@ -225,123 +164,262 @@ def rollout(
     task: str,
     oracle_answer: str,
     num_rollouts: int,
-    reward_fns: list[Callable[[str, str], float]],
     max_length: int = 1024,
     temperature: float = 1.0,
     top_p: float = 1.0,
-    max_tool_loops: int = 3,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[str]]:
-    """
-    Генерирует ответы модели (num_rollouts раз) + проверка вызовов инструментов.
-    
-    Параметры:
-      - reward_fns: список функций награды, каждая принимает (generated_text, oracle_answer).
-        Сумма их возвратов = общая награда (returns[i]).
 
-    Возвращает:
-      - final_sequence_ids: тензор токенов (B x SeqLen) после применения инструментов,
-      - returns: награды (B x 1),
-      - action_mask: булева маска (B x SeqLen), какая часть "действие" (для RL),
-      - final_texts: список строк финальных ответов.
-    """
     model.eval()
 
-    # 1. Формируем prompt
+    # 1. format initial prompt with full conversation structure
     chat_messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user",   "content": task},
+        {
+            "role": "system",
+            "content": system_prompt,
+        },
+        {
+            "role": "user",
+            "content": task,
+        },
     ]
-    # Если есть у tokenizer специальный метод для chat, используем:
-    if hasattr(tokenizer, "apply_chat_template"):
-        chat_prompt = tokenizer.apply_chat_template(
-            chat_messages, tokenize=False, add_generation_prompt=True
-        )
-    else:
-        chat_prompt = system_prompt + "\nUser: " + task + "\nAssistant:"
-
-    # Подготовка к генерации
-    pad_token_id = tokenizer.eos_token_id
-    generation_config = GenerationConfig(
-        do_sample=True,
-        top_p=top_p,
-        temperature=temperature,
-        max_length=max_length,
-        pad_token_id=pad_token_id,
-    )
-    model_inputs = tokenizer(
-        [chat_prompt],
-        return_tensors="pt",
-        padding=True,
-        return_attention_mask=True,
-    ).to("cuda")
-
-    # Дублируем prompt num_rollouts раз
-    model_inputs["input_ids"] = model_inputs["input_ids"].repeat(num_rollouts, 1)
-    model_inputs["attention_mask"] = model_inputs["attention_mask"].repeat(num_rollouts, 1)
-
-    # 2. Генерируем "сырой" ответ
-    raw_sequences = model.generate(**model_inputs, generation_config=generation_config)
-
-    # 3. Раскодируем ответы и обрабатываем вызовы инструментов
-    completions = tokenizer.batch_decode(
-        raw_sequences[:, model_inputs["input_ids"].shape[1]:],
-        skip_special_tokens=True
-    )
-
-    final_texts = []
-    for text in completions:
-        updated_text = text
-        for _ in range(max_tool_loops):
-            # Вызываем инструменты, если они есть
-            new_text = detect_and_call_tools(updated_text)
-            if new_text == updated_text:
-                # Если вызовов инструментов больше нет, завершаем
-                break
-            # Иначе обновляем текст
-            updated_text = new_text
-        final_texts.append(updated_text)
-
-    # 4. Склеиваем prompt + итоговый ответ (после инструментов)
-    prompt_input_ids = model_inputs["input_ids"]
-    new_inputs = tokenizer(final_texts, return_tensors="pt", padding=True).to("cuda")
-
-    # Собираем единый тензор
+    
     all_sequences = []
-    for i in range(num_rollouts):
-        # prompt
-        prompt_seq = prompt_input_ids[i]
-        # финальный ответ
-        answer_seq = new_inputs["input_ids"][i]
-        # склеиваем
-        fused = torch.cat([prompt_seq, answer_seq], dim=0)
-        all_sequences.append(fused.unsqueeze(0))
+    all_completions = []
+    
+    for _ in range(num_rollouts):
+        current_messages = chat_messages.copy()
+        full_response = ""
+        steps_count = 0
+        max_steps = 2  # Ограничиваем до двух шагов
+        
+        # Токенизируем начальный промпт один раз
+        initial_prompt = tokenizer.apply_chat_template(
+            current_messages, tokenize=False, add_generation_prompt=True
+        )
+        prompt_tokens = tokenizer(
+            initial_prompt,
+            return_tensors="pt",
+            padding=True,
+            return_attention_mask=True,
+        ).input_ids.to("cuda")
+        
+        # Сохраняем все токены для этого rollout
+        rollout_tokens = [prompt_tokens[0]]  # Начинаем с промпта
+        
+        while steps_count < max_steps:
+            steps_count += 1
+            
+            # Форматируем текущий диалог
+            chat_prompt = tokenizer.apply_chat_template(
+                current_messages, tokenize=False, add_generation_prompt=True
+            )
+            
+            # Проверяем длину контекста
+            if len(tokenizer.encode(chat_prompt)) > max_length // 2:
+                break
+            
+            # Токенизируем и генерируем
+            model_inputs = tokenizer(
+                chat_prompt,
+                return_tensors="pt",
+                padding=True,
+                return_attention_mask=True,
+            ).to("cuda")
+            
+            generation_config = GenerationConfig(
+                do_sample=True,
+                top_p=top_p,
+                temperature=temperature,
+                max_new_tokens=128,  # Ограничиваем длину каждой генерации
+                pad_token_id=tokenizer.eos_token_id,
+            )
+            
+            sequence_ids = model.generate(**model_inputs, generation_config=generation_config)
+            
+            # Получаем только новые токены (без промпта)
+            new_tokens = sequence_ids[0, model_inputs["input_ids"].shape[1]:]
+            rollout_tokens.append(new_tokens)
+            
+            # Декодируем для обработки
+            completion = tokenizer.decode(new_tokens, skip_special_tokens=True)
 
-    final_sequence_ids = torch.cat(all_sequences, dim=0)
+            # Подробное логирование в wandb
+            log_data = {
+                f"rollout_{_}/step_{steps_count}/raw_completion": completion,
+                f"rollout_{_}/metadata/task": task,
+                f"rollout_{_}/metadata/expected_answer": oracle_answer,
+            }
 
-    # 5. Считаем награды: суммируем результаты функций из reward_fns
-    returns = torch.zeros(num_rollouts, 1, dtype=torch.float, device=final_sequence_ids.device)
-    for i, completion in enumerate(final_texts):
-        total_reward = sum_rewards(completion, oracle_answer, reward_fns)
-        returns[i] = total_reward
+            # Проверяем формат ответа
+            if steps_count == 1:
+                # Первый шаг должен заканчиваться вызовом инструмента
+                if not re.search(r"<tool:calc>.*?</tool>$", completion, flags=re.DOTALL):
+                    print(f"WARNING: First step does not end with tool call: {completion}")
+                    # Пропускаем этот rollout
+                    break
+            else:
+                # Второй шаг должен содержать только ответ
+                if not re.match(r"^\s*<answer>.*?</answer>\s*$", completion, flags=re.DOTALL):
+                    print(f"WARNING: Second step should contain only answer tag: {completion}")
+                    # Пропускаем этот rollout
+                    break
 
-    # 6. Формируем action_mask (где часть после prompt является "действием")
-    action_mask = torch.zeros_like(final_sequence_ids, dtype=torch.bool)
-    prompt_len = prompt_input_ids.shape[1]
-    for i in range(num_rollouts):
-        seq_len = final_sequence_ids[i].shape[0]
-        action_mask[i, prompt_len:seq_len] = True
+            # Обрабатываем вызовы инструментов
+            processed_completion = detect_and_call_tools(completion)
 
-    return final_sequence_ids, returns, action_mask, final_texts
+            # Анализируем структуру ответа для wandb
+            reasoning_match = re.search(r"<reasoning>(.*?)</reasoning>", completion, flags=re.DOTALL)
+            if reasoning_match:
+                log_data[f"rollout_{_}/step_{steps_count}/reasoning"] = reasoning_match.group(1).strip()
+
+            # Если был вызов инструмента
+            if processed_completion != completion:
+                tool_calls = list(re.finditer(r"<tool:(\w+)>(.*?)</tool>", completion, flags=re.DOTALL))
+                tool_results = list(re.finditer(r"<tool_result>(.*?)</tool_result>", processed_completion))
+                
+                for idx, (call, result) in enumerate(zip(tool_calls, tool_results)):
+                    tool_name = call.group(1)
+                    tool_input = call.group(2).strip()
+                    tool_result = result.group(1)
+                    
+                    log_data.update({
+                        f"rollout_{_}/step_{steps_count}/tool_{idx}/name": tool_name,
+                        f"rollout_{_}/step_{steps_count}/tool_{idx}/input": tool_input,
+                        f"rollout_{_}/step_{steps_count}/tool_{idx}/result": tool_result,
+                    })
+                    
+                    # Выводим на экран информацию о задаче и вызове инструмента
+                    if steps_count == 1 and idx == 0:  # Только для первого шага и первого вызова
+                        print(f"\nЗадача: {task}")
+                        print(f"Ожидаемый ответ: {oracle_answer}")
+                        print("-" * 40)
+                    print(f"Rollout {_+1}/{num_rollouts} | Step {steps_count} | {tool_name}({tool_input}) = {tool_result}")
+
+            answer_match = re.search(r"<answer>(.*?)</answer>", processed_completion, flags=re.DOTALL)
+            if answer_match:
+                answer = answer_match.group(1).strip()
+                log_data[f"rollout_{_}/step_{steps_count}/final_answer"] = answer
+                print(f"Rollout {_+1}/{num_rollouts} | Answer: {answer}")
+                # Добавляем информацию о правильности ответа
+                is_correct = answer == oracle_answer
+                is_partially_correct = oracle_answer in answer if not is_correct else False
+                print(f"{'✓' if is_correct else ('≈' if is_partially_correct else '✗')} (expected: {oracle_answer})")
+                print("-" * 40)
+
+            log_data[f"rollout_{_}/step_{steps_count}/processed_completion"] = processed_completion
+            wandb.log(log_data)
+
+            full_response += processed_completion
+            
+            # Добавляем ответ ассистента в диалог
+            current_messages.append({"role": "assistant", "content": processed_completion})
+            
+            # Если есть результат инструмента, добавляем его как сообщение от системы
+            if "<tool_result>" in processed_completion:
+                tool_result = re.search(r"<tool_result>(.*?)</tool_result>", processed_completion)
+                if tool_result:
+                    result_msg = f"Tool result: {tool_result.group(1)}"
+                    current_messages.append({"role": "system", "content": result_msg})
+                    
+                    # Токенизируем результат инструмента
+                    tool_result_tokens = tokenizer(
+                        result_msg,
+                        return_tensors="pt",
+                        add_special_tokens=False
+                    ).input_ids[0].to("cuda")
+                    rollout_tokens.append(tool_result_tokens)
+        
+        # Собираем все токены в одну последовательность
+        full_sequence = torch.cat(rollout_tokens)
+        all_sequences.append(full_sequence)
+        all_completions.append(full_response)
+    
+    # Паддинг последовательностей до одинаковой длины
+    max_seq_length = max(seq.size(0) for seq in all_sequences)
+    padded_sequences = []
+    for seq in all_sequences:
+        padding_length = max_seq_length - seq.size(0)
+        padded_seq = torch.cat([seq, torch.full((padding_length,), tokenizer.pad_token_id, device=seq.device)])
+        padded_sequences.append(padded_seq)
+    
+    sequence_ids = torch.stack(padded_sequences)
+    
+    # Создаем маску действий
+    action_mask = torch.zeros_like(sequence_ids, dtype=torch.bool)
+    for i, seq in enumerate(all_sequences):
+        # Маскируем только токены, сгенерированные моделью (не промпт и не результаты инструментов)
+        prompt_length = len(rollout_tokens[0])
+        for j in range(1, len(rollout_tokens), 2):  # Пропускаем результаты инструментов
+            start_idx = sum(len(t) for t in rollout_tokens[:j])
+            end_idx = start_idx + len(rollout_tokens[j])
+            action_mask[i, start_idx:end_idx] = True
+    action_mask[sequence_ids == tokenizer.pad_token_id] = False
+    action_mask = action_mask[:, 1:]  # сдвигаем на 1, так как нам нужны следующие токены
+    
+    # Определяем награды
+    returns = torch.zeros(num_rollouts, 1, dtype=torch.float)
+    for i, completion in enumerate(all_completions):
+        # Награда за использование инструмента
+        if "<tool:calc>" in completion and "<tool_result>" in completion:
+            returns[i] += 0.2
+            
+        # Награда за правильный ответ
+        answer_match = re.search(r"<answer>(.*?)</answer>", completion, flags=re.DOTALL)
+        if answer_match:
+            answer = answer_match.group(1).strip()
+            if answer == oracle_answer:
+                returns[i] += 1.0
+            elif oracle_answer in answer:
+                returns[i] += 0.5
+            else:
+                returns[i] += 0.01
+
+    return sequence_ids, returns.to(sequence_ids.device), action_mask, all_completions
 
 
-###############################################################################
-# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ ЧТЕНИЯ ДАННЫХ
-###############################################################################
+def init_rng(seed: int) -> torch.Generator:
+    random.seed(seed)
+    return torch.manual_seed(seed)
+
+
+def group_advantages(returns: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    return (returns - returns.mean()) / (returns.std() + eps)
+
+
+def sequence_log_probs_from_logits(
+    logits: torch.tensor, output_ids: torch.tensor
+) -> torch.Tensor:
+    log_prob = F.log_softmax(logits, dim=-1)
+    return log_prob.gather(dim=-1, index=output_ids.unsqueeze(-1)).squeeze(-1)
+
+
+def sequences_log_probs(
+    model: AutoModelForCausalLM,
+    sequence_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+) -> torch.Tensor:
+    position_ids = attention_mask.long().cumsum(dim=-1) - 1
+    position_ids.masked_fill_(mask=(attention_mask == 0), value=1)
+    output = model.forward(
+        input_ids=sequence_ids,
+        attention_mask=attention_mask,
+        position_ids=position_ids,
+        use_cache=False,
+    )
+    logits = output["logits"]
+    log_probs = sequence_log_probs_from_logits(
+        logits=logits[:, :-1].to(torch.float32),
+        output_ids=sequence_ids[:, 1:],
+    )
+    return log_probs
+
+
 def read_jsonl(file_name: str | Path) -> Iterator:
     file_path = Path(file_name)
     with file_path.open(mode="r", encoding="utf-8") as f:
         for line in f:
             yield json.loads(line)
+
 
 def read_prompts(
     file_name: str,
@@ -357,63 +435,7 @@ def read_prompts(
     return rows
 
 
-###############################################################################
-# ДРУГИЕ ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ RL-ТРЕНИРОВКИ
-###############################################################################
-def init_rng(seed: int) -> torch.Generator:
-    random.seed(seed)
-    return torch.manual_seed(seed)
-
-def group_advantages(returns: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
-    """
-    Нормализация возвратов (returns) -> advantages.
-    """
-    return (returns - returns.mean()) / (returns.std() + eps)
-
-def sequence_log_probs_from_logits(
-    logits: torch.Tensor, output_ids: torch.Tensor
-) -> torch.Tensor:
-    """
-    Вычислить log_softmax + выбрать индекс выходного токена.
-    Возвращает размер [B, seq_len-1], если logits = [B, seq_len, vocab],
-    output_ids = [B, seq_len], срезая последний логит и первый токен.
-    """
-    log_prob = F.log_softmax(logits, dim=-1)
-    return log_prob.gather(dim=-1, index=output_ids.unsqueeze(-1)).squeeze(-1)
-
-def sequences_log_probs(
-    model: AutoModelForCausalLM,
-    sequence_ids: torch.Tensor,
-    attention_mask: torch.Tensor,
-) -> torch.Tensor:
-    """
-    Считаем log_probs (форма [B, seq_len-1]) по сдвинутой схеме:
-    - logits[:, :-1, :] vs sequence_ids[:, 1:].
-    """
-    position_ids = attention_mask.long().cumsum(dim=-1) - 1
-    position_ids.masked_fill_(attention_mask == 0, value=1)
-    output = model.forward(
-        input_ids=sequence_ids,
-        attention_mask=attention_mask,
-        position_ids=position_ids,
-        use_cache=False,
-    )
-    logits = output["logits"]  # [B, seq_len, vocab]
-    # убираем последний логит и первый токен
-    log_probs = F.log_softmax(logits[:, :-1, :], dim=-1)
-    # log_probs.shape = [B, seq_len-1, vocab]
-    next_tokens = sequence_ids[:, 1:]  # [B, seq_len-1]
-    gathered = log_probs.gather(dim=-1, index=next_tokens.unsqueeze(-1)).squeeze(-1)  # [B, seq_len-1]
-    return gathered
-
-
-###############################################################################
-# ОСНОВНАЯ ФУНКЦИЯ TRAIN (main)
-###############################################################################
 def main():
-    # ------------------------------
-    # ПАРАМЕТРЫ
-    # ------------------------------
     seed = 42
     wandb_project = None  # "tiny_grpo"
     device_index = 0
@@ -425,7 +447,7 @@ def main():
     kl_weight = 0.01
     clip_eps = 0.2
 
-    # Параметры квантизации и LoRA
+    # Добавляем параметры для квантизации и LoRA
     use_4bit = True
     use_lora = True
     bf16 = True
@@ -444,51 +466,36 @@ def main():
     cpu_device = torch.device("cpu")
     init_rng(seed)
 
-    # ------------------------------
-    # СПИСОК ФУНКЦИЙ НАГРАД
-    # ------------------------------
-    reward_fns = [
-        # 1) награда за использование тула "calc"
-        lambda text, oracle: reward_for_tool_usage(text, "calc", 0.2),
-        # 2) награда за правильный ответ
-        lambda text, oracle: reward_for_correct_answer(text, oracle),
-    ]
-
-    # ------------------------------
-    # МОДЕЛЬ-РЕФЕРЕНС
-    # ------------------------------
     reference_model, _ = load_model(
-        model_name,
+        model_name, 
         device_map=device,
         use_4bit=use_4bit,
         use_lora=False,
         bf16=bf16
     )
-    reference_model.eval()
-
-    # ------------------------------
-    # МОДЕЛЬ ДЛЯ ОБУЧЕНИЯ
-    # ------------------------------
     model, tokenizer = load_model(
-        model_name,
+        model_name, 
         device_map=device,
         use_4bit=use_4bit,
         use_lora=use_lora,
         bf16=bf16
     )
+    
+    # Обновляем оптимизатор для работы только с обучаемыми параметрами
     optimizer = AdamW32bit(model.parameters(), lr=lr, is_paged=True)
+
+    reference_model.eval()
     model.gradient_checkpointing_enable(
         gradient_checkpointing_kwargs={"use_reentrant": False}
     )
 
     pad_token_id = tokenizer.eos_token_id
 
-    # ------------------------------
-    # ДАТАСЕТ
-    # ------------------------------
     prompts = read_prompts(
         "data/math_tasks.jsonl",
-        predicate=lambda x: len(x["question"]) < 128 and x["num_terms"] <= 3 and x["num_digits"] <= 3,
+        predicate=lambda x: len(x["question"]) < 128
+        and x["num_terms"] <= 3
+        and x["num_digits"] <= 3,
         max_rows=64 * 1024,
     )
     print(f"found {len(prompts)} matching prompts")
@@ -500,9 +507,6 @@ def main():
         pin_memory=False,
     )
 
-    # ------------------------------
-    # GRPO-LOOP
-    # ------------------------------
     replay_buffer = ReplayBuffer()
     objective = GRPOLoss(clip_eps=clip_eps, kl_weight=kl_weight)
 
@@ -511,11 +515,9 @@ def main():
     else:
         wandb.init(project=wandb_project)
 
-    # ------------------------------
-    # ОСНОВНОЙ ЦИКЛ
-    # ------------------------------
     for k, prompt_batch in enumerate(prompt_loader):
         rollout_returns = []
+
         replay_buffer.clear()
 
         questions = prompt_batch["question"]
@@ -523,32 +525,25 @@ def main():
 
         with torch.no_grad():
             for q, a in zip(questions, answers):
-                # Вызов нашего rollout c учетом инструментов и списка функций наград
                 sequence_ids, returns, action_mask, completions = rollout(
-                    model=model,
-                    tokenizer=tokenizer,
-                    task=q,
-                    oracle_answer=a,
+                    model,
+                    tokenizer,
+                    q,
+                    a,
                     num_rollouts=group_size,
-                    reward_fns=reward_fns,  # <-- передаём список функций наград
                     max_length=max_length,
                     temperature=temperature,
                     top_p=top_p,
                 )
 
                 print(
-                    f"rollout q='{q}', a='{a}', returns={returns.sum().item():.2f}, "
-                    f"replay_buffer_size={len(replay_buffer)}, sequence_ids={sequence_ids.shape}"
+                    f"rollout q='{q}', a='{a}', returns={returns.sum().item():.2f}, replay_buffer_size={len(replay_buffer)}, sequence_ids={sequence_ids.shape}"
                 )
                 rollout_returns.append(returns.cpu())
 
-                # Вычисляем advantages
                 advantages = group_advantages(returns)
+                attention_mask = sequence_ids != pad_token_id
 
-                # attention_mask: где токены не паддинг
-                attention_mask = (sequence_ids != pad_token_id)
-
-                # Считаем лог-вероятности (форма [B, seq_len-1])
                 log_probs = sequences_log_probs(
                     model=model,
                     sequence_ids=sequence_ids,
@@ -559,18 +554,12 @@ def main():
                     sequence_ids=sequence_ids,
                     attention_mask=attention_mask,
                 )
-
-                # Обрезаем action_mask до [B, seq_len-1]
-                action_mask = action_mask[:, 1:]
-
-                # KL
                 kl = approx_kl_divergence(
                     log_probs=log_probs,
                     log_probs_ref=log_probs_ref,
                     action_mask=action_mask,
                 )
 
-                # Сохраняем всё в опыт
                 experience = Experience(
                     sequences=sequence_ids,
                     action_log_probs=log_probs,
@@ -583,17 +572,11 @@ def main():
                 )
                 replay_buffer.append(experience.to(cpu_device))
 
-        # ------------------------------
-        # ЛОГИ, ОЧИСТКА
-        # ------------------------------
         torch.cuda.empty_cache()
         episode_return_sum = torch.stack(rollout_returns).sum()
         print(f"returns of step {k}: {episode_return_sum:.4f}")
         wandb.log({"returns": episode_return_sum})
 
-        # ------------------------------
-        # ОБУЧЕНИЕ НА СОБРАННОМ ОПЫТЕ (replay_buffer)
-        # ------------------------------
         experience_sampler = DataLoader(
             replay_buffer,
             batch_size=train_batch_size,
@@ -604,33 +587,32 @@ def main():
 
         for step_epoch in range(epochs_per_step):
             model.train()
+
             for exp in experience_sampler:
                 exp: Experience
+
                 exp = exp.to(device)
 
                 optimizer.zero_grad()
+
                 log_probs = sequences_log_probs(
-                    model,
-                    sequence_ids=exp.sequences,
-                    attention_mask=exp.attention_mask
+                    model, sequence_ids=exp.sequences, attention_mask=exp.attention_mask
                 )
 
-                loss, kl_val = objective(log_probs=log_probs, experience=exp)
+                loss, kl = objective(log_probs=log_probs, experience=exp)
+
                 if not loss.isfinite():
                     print(f"Loss not finite, skipping backward, loss={loss}")
-                    print(f"experience.advantages={exp.advantages}")
+                    print(f"experience.advantages={experience.advantages}")
                     continue
 
                 loss.backward()
                 grad_norm = clip_grad_norm_(model.parameters(), max_norm=max_norm)
-                print(f"{step_epoch}: kl={kl_val: .4f}, grad_norm={grad_norm: .4f}")
-                wandb.log({"kl": kl_val, "grad_norm": grad_norm})
+                print(f"{step_epoch}: kl={kl: .4f}, grad_norm={grad_norm: .4f}")
+                wandb.log({"kl": kl, "grad_norm": grad_norm})
 
                 optimizer.step()
 
-        # ------------------------------
-        # ЧЕКПОИНТ
-        # ------------------------------
         if (
             checkpoint_path is not None
             and checkpoint_interval is not None
@@ -638,7 +620,6 @@ def main():
         ):
             model.save_pretrained(checkpoint_path / f"step_{k}")
 
-    # Финальное сохранение
     if checkpoint_path is not None:
         model.save_pretrained(checkpoint_path / f"step_{k}")
 
