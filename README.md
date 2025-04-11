@@ -45,6 +45,13 @@ accelerate launch train_accelerate.py
 
 The `train_accelerate.py` script leverages Hugging Face Accelerate for CPU offloading to optimize memory usage and allow training larger models.
 
+Run multiturn 2-step calculator using training:
+
+```
+python train_multiturn_calc_tool_calling.py
+```
+
+
 ### Inspiration
 
 - [OpenRLHF](https://github.com/OpenRLHF/OpenRLHF)
