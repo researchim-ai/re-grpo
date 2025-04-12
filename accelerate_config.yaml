@@ -1,0 +1,37 @@
+# Базовая конфигурация для accelerate
+# Запустите `accelerate config` для интерактивной настройки
+
+compute_environment: LOCAL_MACHINE # Среда вычислений (напр., LOCAL_MACHINE, AMAZON_SAGEMAKER, KUBERNETES)
+distributed_type: MULTI_GPU # Используем обычный MULTI_GPU, это лучше для bitsandbytes и PEFT
+mixed_precision: 'bf16' # Тип смешанной точности ('no', 'fp16', 'bf16')
+use_cpu: false # Использовать ли только CPU
+
+# --- Настройки для мульти-GPU ---
+num_processes: 2 # Используем 2 GPU 
+machine_rank: 0 # Ранг текущей машины (для мульти-нодовой тренировки)
+num_machines: 1 # Общее количество машин (для мульти-нодовой тренировки)
+main_process_ip: null # Для локальной тренировки оставляем null
+main_process_port: 29501 # Устанавливаем фиксированный порт, чтобы избежать конфликтов
+
+# --- Настройки FSDP ---
+fsdp_config:
+  fsdp_auto_wrap_policy: SIZE_BASED_WRAP # Используем оборачивание на основе размера параметров
+  fsdp_min_num_params: 1000000 # Минимальное количество параметров для оборачивания
+  fsdp_backward_prefetch: BACKWARD_PRE # Предзагрузка для обратного прохода
+  fsdp_cpu_ram_efficient_loading: true # Экономия RAM при загрузке
+  fsdp_forward_prefetch: false # Предзагрузка для прямого прохода (обычно не нужна)
+  fsdp_offload_params: true # Выгрузка параметров на CPU для экономии VRAM
+  fsdp_sharding_strategy: FULL_SHARD # Стратегия шардинга (полное шардирование)
+  fsdp_state_dict_type: FULL_STATE_DICT # Тип сохраняемого state_dict
+  fsdp_sync_module_states: true # Синхронизация состояний модуля
+  fsdp_use_orig_params: true # Использование оригинальных параметров
+
+deepspeed_config: {}
+
+# --- Настройки ресурсов ---
+# main_training_function: main # Имя главной функции в скрипте (если не стандартное)
+# downcast_bf16: 'no'
+
+# --- Настройки логирования ---
+# log_with: # Например: 'wandb', 'tensorboard'
+# project_dir: # Директория для логов 
