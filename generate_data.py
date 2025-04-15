@@ -5,7 +5,7 @@ This script performs two main tasks:
 2. It generates QA pairs from the document using Qwen model.
    For each chunk (using a sliding window for context), it generates multiple question-answer pairs
    with different difficulties. The generation is performed in batch with one retry for failed prompts.
-   Successfully generated QA pairs are saved to "saved_data/questions.json".
+   Successfully generated QA pairs are saved to "qa_generated_data/questions.json".
 
 Requirements:
     pip install langchain faiss-cpu transformers
@@ -97,17 +97,18 @@ text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=0)
 chunks = text_splitter.split_documents(docs)
 
 # Save chunks for later use
-os.makedirs("saved_data", exist_ok=True)
-with open("saved_data/chunks.pkl", "wb") as f:
+os.makedirs("qa_generated_data", exist_ok=True)
+with open("qa_generated_data/chunks.pkl", "wb") as f:
     pickle.dump(chunks, f)
-print(f"Saved {len(chunks)} chunks to saved_data/chunks.pkl")
+print(f"Saved {len(chunks)} chunks to qa_generated_data/chunks.pkl")
 
 embeddings = CustomHuggingFaceEmbeddings()
 
 # Create a FAISS vector store from the document chunks and save it locally
 vectorstore = FAISS.from_documents(chunks, embeddings)
-vectorstore.save_local("faiss_index")
-print("Saved FAISS index to 'faiss_index'")
+# Сохраняем индекс в правильной директории, которую будет искать search_module.py
+vectorstore.save_local("qa_generated_data/document_index")
+print("Saved FAISS index to 'qa_generated_data/document_index'")
 
 # Освобождаем память
 del embeddings, vectorstore
@@ -322,7 +323,7 @@ def generate_question_batch_for_chunks(chunks: List, num_questions: int = 2, dif
         chunk_ids.append(i)
     
     # Проверяем существует ли уже финальный файл с вопросами
-    questions_path = os.path.join("saved_data", "questions.json")
+    questions_path = os.path.join("qa_generated_data", "questions.json")
     if os.path.exists(questions_path):
         try:
             with open(questions_path, "r") as f:
@@ -421,10 +422,10 @@ def generate_question_batch_for_chunks(chunks: List, num_questions: int = 2, dif
 
 def cleanup_batch_files():
     """Удаляет промежуточные файлы батчей после успешного завершения"""
-    for filename in os.listdir("saved_data"):
+    for filename in os.listdir("qa_generated_data"):
         if filename.startswith("questions_batch_") and filename.endswith(".json"):
             try:
-                os.remove(os.path.join("saved_data", filename))
+                os.remove(os.path.join("qa_generated_data", filename))
                 print(f"Удален промежуточный файл: {filename}")
             except OSError as e:
                 print(f"Ошибка при удалении {filename}: {e}")
@@ -438,7 +439,7 @@ print(f"Generated {len(all_questions)} QA pairs.")
 cleanup_batch_files()
 
 # Перезаписываем финальный файл с правильной кодировкой
-questions_path = os.path.join("saved_data", "questions.json")
+questions_path = os.path.join("qa_generated_data", "questions.json")
 with open(questions_path, "w", encoding="utf-8") as f:
     json.dump(all_questions, f, indent=2, ensure_ascii=False)
 print(f"Saved questions to {questions_path} with proper encoding")

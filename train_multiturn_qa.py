@@ -30,6 +30,13 @@ from replay_buffer import ReplayBuffer, Experience, join_experience_batch
 import argparse
 from datetime import datetime # Добавляем импорт datetime
 
+# Импортируем модуль поиска
+try:
+    from search_module import vectorstore, search
+except ImportError:
+    print("Warning: search_module not found. Search functionality will be limited.")
+    vectorstore = None
+
 # --- Добавляем константы для цветов ---
 COLOR_RESET = "\033[0m"
 COLOR_GREEN = "\033[92m"
@@ -162,6 +169,37 @@ def calc_tool(expression: str) -> str:
         # Возвращаем более информативную ошибку
         return f"Calc error: Cannot evaluate '{expression}'. Details: {e}"
 
+# Добавление инструмента поиска
+@register_tool("search")
+def search_tool(query: str) -> str:
+    """
+    Инструмент для поиска информации по запросу.
+    """
+    try:
+        if not query.strip():
+            return "Search error: Пустой запрос"
+        
+        # Импортируем все из search_module, если еще не импортировано
+        from search_module import search
+        
+        # Используем функцию search из модуля
+        search_results = search(query, k=3)
+        
+        # Форматируем результаты
+        result = ""
+        for idx, sr in enumerate(search_results, start=1):
+            result += f"Результат {idx}:\n{sr['content']}\n"
+            if sr.get('score'):
+                result += f"Релевантность: {sr['score']:.4f}\n"
+            result += "------\n"
+            
+        if not result:
+            return "По вашему запросу ничего не найдено."
+            
+        return result
+    except Exception as e:
+        return f"Ошибка поиска: {e}"
+
 # --- Изменяем detect_and_call_tools ---
 def detect_and_call_tools(generated_text: str) -> Optional[Tuple[str, str, str]]:
     """
@@ -257,33 +295,35 @@ def load_model(
 
     return model, tokenizer
 
-system_prompt = """You are a helpful assistant that reason, call tools and provide answer. The user provde tasks and you solve it as it described."""
-# Первый системный промпт - только для рассуждения и вызова инструмента
-first_step_prompt = """- Think about the reasoning process and explain it within <reasoning>...</reasoning> tags
-- Call the calculation tool using: <tool:calc>user asked question for calculation</tool>
+system_prompt = """You are a helpful assistant that can search and provide answers to questions. Your responses should be accurate, concise, and based on the search results."""
+
+# Первый системный промпт - для поиска информации
+first_step_prompt = """- Think about how to answer the user's question
+- First, you need to search for relevant information
+- Search tool format: <tool:search>user's question</tool>
 
 Here is the format example:
 
-Calculate 2 + 2
+What happened during the Apollo 13 mission?
 
-<reasoning>I need to add these numbers together</reasoning>
-<tool:calc>2 + 2</tool>
+<reasoning>I need to search for information about the Apollo 13 mission</reasoning>
+<tool:search>Apollo 13 mission details</tool>
 
 Your task:
 """
 
-# Второй системный промпт - только для ответа
-second_step_prompt = """A conversation between User and Assistant. Now you need to copy answer from tool to answer tag.
+# Второй системный промпт - для формулировки ответа на основе результатов поиска
+second_step_prompt = """Based on the search results, provide a clear and concise answer.
 
 - Your response MUST contain only the answer tag
-- After receiving the tool result, provide the final answer within <answer>...</answer> tags
+- After receiving the search results, provide the final answer within <answer>...</answer> tags
 
 Format Example:
 
-Tool result: 4
-<answer>4</answer>
+Search results: Paris is the capital of France
+<answer>Paris</answer>
 
-Here is Tool output:
+Here are the search results:
 """
 
 @torch.no_grad()
@@ -654,7 +694,7 @@ def parse_args():
     parser.add_argument('--model-name', type=str, default="Qwen/Qwen2.5-3B-Instruct", help='Model name or path')
     parser.add_argument('--checkpoint-path', type=str, default="./output", help='Path to save checkpoints')
     parser.add_argument('--checkpoint-interval', type=int, default=20, help='Save checkpoint every N batches')
-    parser.add_argument('--data-path', type=str, default="data/math_tasks.jsonl", help='Path to training data')
+    parser.add_argument('--data-path', type=str, default="qa_generated_data/questions.json", help='Path to training data')
     parser.add_argument('--max-prompts', type=int, default=1024, help='Maximum number of prompts to load (reduced for faster testing)')
     parser.add_argument('--group-size', type=int, default=4, help='Number of rollouts per task (num_rollouts)')
     parser.add_argument('--rollouts-per-step', type=int, default=4, help='Number of tasks per batch (batch size for rollout phase)')
