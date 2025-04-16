@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 import os
 # так можно выбирать устройство для запуска LLM
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+# os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 
 from collections.abc import Callable
 import json
@@ -25,7 +25,7 @@ from transformers import (
 )
 from bitsandbytes.optim import AdamW32bit, AdamW8bit
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
-from loss import approx_kl_divergence, GRPOLoss
+from qa_loss import approx_kl_divergence, GRPOLoss
 from replay_buffer import ReplayBuffer, Experience, join_experience_batch
 import argparse
 from datetime import datetime # Добавляем импорт datetime
@@ -335,7 +335,7 @@ def rollout(
     num_rollouts: int,
     logger: Logger, # Принимаем объект Logger
     global_step: int,
-    max_length: int = 1024,
+    max_length: int = 2048,
     temperature: float = 0.7,
     top_p: float = 1.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[str]]:
@@ -732,7 +732,7 @@ def main():
     bf16 = True
 
     epochs_per_step = 1 # Можно сделать параметром
-    max_norm = 1.0 # Можно сделать параметром
+    max_norm = 0.2 # Можно сделать параметром
     top_p = 1.0 # Можно сделать параметром
     kl_weight=0.01 # Можно сделать параметром
     clip_eps=0.2 # Можно сделать параметром

@@ -175,3 +175,5 @@ cython_debug/
 
 output/
 runs/
+qa_generated_data/
+wandb/
