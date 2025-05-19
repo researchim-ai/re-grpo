@@ -21,36 +21,62 @@ pip install accelerate
 
 3. Play with the source
 
-Run standard training:
+Each experiment is now located in its own directory.
 
+**1. Base Experiment (Single GPU, no Accelerate)**
+
+To run the basic training script:
+```bash
+python experiment_base/train.py
 ```
-python train.py
-```
 
-or use the accelerate script:
+**2. Accelerate Experiment (Single/Multi-GPU with Accelerate)**
 
-First, configure accelerate:
-
-```
+First, configure Accelerate if you haven't already:
+```bash
 accelerate config
 ```
+Follow the prompts. For single GPU, you might choose "This machine" and "No distributed training". For multi-GPU, configure accordingly.
 
-Select CPU offloading options when prompted.
-
-Then, launch training:
-
-```
-accelerate launch train_accelerate.py
+Then, launch the training:
+```bash
+accelerate launch experiment_accelerate/train_accelerate.py
 ```
 
-The `train_accelerate.py` script leverages Hugging Face Accelerate for CPU offloading to optimize memory usage and allow training larger models.
+**3. Accelerate DDP Experiment (Multi-GPU with Accelerate DDP)**
 
-Run multiturn 2-step calculator using training:
-
+Ensure Accelerate is configured for DDP (Distributed Data Parallel).
+```bash
+accelerate config
 ```
-python train_multiturn_calc_tool_calling.py
+Choose "This machine" and select the number of GPUs you want to use for distributed training.
+
+Then, launch the training:
+```bash
+accelerate launch experiment_accelerate_ddp/train_accelerate_ddp.py
 ```
 
+**4. Multiturn Calculator Tool Calling Experiment**
+
+This script trains a model for multi-turn interactions involving a calculator tool.
+```bash
+python experiment_multiturn_tool_calling/train_multiturn_calc_tool_calling.py
+```
+This script accepts command-line arguments. Use `--help` to see available options:
+```bash
+python experiment_multiturn_tool_calling/train_multiturn_calc_tool_calling.py --help
+```
+
+**5. Multiturn QA with Search Tool Experiment**
+
+This script trains a model for multi-turn QA that can use a search tool.
+```bash
+python experiment_multiturn_qa/train_multiturn_qa.py
+```
+This script also accepts command-line arguments. Use `--help` to see available options:
+```bash
+python experiment_multiturn_qa/train_multiturn_qa.py --help
+```
 
 ### Inspiration
 
