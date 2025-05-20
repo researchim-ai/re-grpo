@@ -1,21 +1,97 @@
+"""
+Модуль для выполнения "прогонов" (rollouts) модели в задаче QA с поиском.
+
+Содержит функцию `rollout`, которая моделирует двухэтапный процесс:
+1. Модель генерирует поисковый запрос на основе вопроса пользователя.
+2. Модель генерирует ответ на основе результатов поиска.
+
+Примечание: Этот файл содержит функцию `rollout`, которая очень похожа на
+одноименную функцию в `train_multiturn_qa.py`. Однако, эта версия напрямую
+использует `search_module.search` вместо общей системы инструментов, как в
+`train_multiturn_qa.py`. Возможно, это более ранняя или специализированная версия.
+Необходимы также определения `system_prompt`, `first_step_prompt`, `second_step_prompt`
+и цветовых констант, которые здесь не представлены, но предполагаются из контекста
+(например, из `train_multiturn_qa.py`).
+"""
 import torch
 import re
 from typing import Optional, Tuple, List
-from transformers import AutoModelForCausalLM, PreTrainedTokenizer
+from transformers import AutoModelForCausalLM, PreTrainedTokenizer, GenerationConfig
 from search_module import search
+
+# Предполагается, что эти переменные определены где-то глобально или передаются иначе.
+# Для примера, можно раскомментировать и задать их.
+# system_prompt = "Your system prompt here"
+# first_step_prompt = "Your first step prompt here"
+# second_step_prompt = "Your second step prompt here"
+# COLOR_GREEN = "\033[92m"
+# COLOR_RED = "\033[91m"
+# COLOR_YELLOW = "\033[93m"
+# COLOR_RESET = "\033[0m"
 
 def rollout(
     model: AutoModelForCausalLM,
     tokenizer: PreTrainedTokenizer,
-    task: str,
-    oracle_answer: str,
-    num_rollouts: int,
-    logger,
-    global_step: int,
-    max_length: int = 1024,
-    temperature: float = 0.7,
-    top_p: float = 1.0,
+    task: str, # Вопрос пользователя
+    oracle_answer: str, # Эталонный ответ
+    num_rollouts: int, # Количество прогонов для задачи
+    logger: object, # Объект логгера (например, из train_multiturn_qa.Logger)
+    global_step: int, # Глобальный шаг для логирования
+    # Добавляем промпты и цвета как аргументы, чтобы избежать зависимости от глобальных переменных
+    system_prompt: str,
+    first_step_prompt: str,
+    second_step_prompt: str,
+    color_green: str,
+    color_red: str,
+    color_yellow: str,
+    color_reset: str,
+    max_length: int = 1024, # Макс. длина генерации
+    temperature: float = 0.7, # Температура для семплирования
+    top_p: float = 1.0, # Top-p для семплирования
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[str]]:
+    """
+    Выполняет "прогоны" (rollouts) модели для задачи QA с использованием поиска.
+
+    Процесс для каждого прогона:
+    1.  **Шаг 1 (Поиск):**
+        - Модель получает промпт для генерации вызова поискового инструмента
+          в формате `<tool:search>ЗАПРОС</tool>`.
+        - Если вызов корректен, выполняется поиск с помощью `search_module.search`.
+        - Фиксируются награды за формат вызова и успешность выполнения поиска.
+    2.  **Шаг 2 (Ответ):**
+        - Если поиск успешен, модель получает результаты поиска и промпт для генерации
+          ответа в формате `<answer>ОТВЕТ</answer>`.
+        - Фиксируются награды за формат ответа и его корректность по сравнению с `oracle_answer`.
+
+    Собирает и логирует детальную статистику по каждому прогону и по группе прогонов.
+    Возвращает сгенерированные последовательности, награды и маски для последующего обучения.
+
+    Args:
+        model: Языковая модель для генерации.
+        tokenizer: Токенизатор для модели.
+        task: Входной вопрос пользователя.
+        oracle_answer: Эталонный (правильный) ответ.
+        num_rollouts: Количество прогонов для выполнения.
+        logger: Экземпляр логгера для записи метрик.
+        global_step: Текущий глобальный шаг обучения (для логирования).
+        system_prompt (str): Системный промпт для модели.
+        first_step_prompt (str): Промпт для первого шага (генерация поиска).
+        second_step_prompt (str): Промпт для второго шага (генерация ответа).
+        color_green (str): Код цвета для успешных сообщений в консоли.
+        color_red (str): Код цвета для сообщений об ошибках в консоли.
+        color_yellow (str): Код цвета для предупреждающих сообщений в консоли.
+        color_reset (str): Код для сброса цвета в консоли.
+        max_length: Максимальная длина генерируемых последовательностей.
+        temperature: Температура для семплирования при генерации.
+        top_p: Параметр top-p (nucleus sampling) для генерации.
+
+    Returns:
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[str]]:
+            - `sequence_ids` (torch.Tensor): Паддированные тензоры всех сгенерированных токенов (включая промпты).
+            - `returns` (torch.Tensor): Тензор суммарных наград для каждого прогона.
+            - `action_mask` (torch.Tensor): Маска, указывающая на сгенерированные моделью токены (действия).
+            - `all_completions_text` (list[str]): Список полных текстовых диалогов (промпты + генерация + результаты поиска) для каждого прогона.
+    """
 
     model.eval()
     all_sequences = []
@@ -104,18 +180,18 @@ def rollout(
                 group_stats["search_executed_ok_count"] += 1
                 rollout_stats["search_result"] = actual_search_result
                 full_dialog_text_for_log += f"**Search Results:**\n```\n{actual_search_result}\n```\n"
-                print(f"Rollout {rollout_idx+1}/{num_rollouts} | Step 1 | {COLOR_GREEN}Search OK:{COLOR_RESET} {search_query}")
+                print(f"{color_green}Rollout {rollout_idx+1}/{num_rollouts} | Step 1 | {color_reset}Search OK:{color_reset} {search_query}")
             except Exception as e:
                 rewards["step1_search_execution"] -= 1.0
                 step1_failed = True
                 rollout_stats["error_type"] = "Search Execution Error"
-                print(f"Rollout {rollout_idx+1}/{num_rollouts} | Step 1 | {COLOR_RED}Search Error:{COLOR_RESET} {e}")
+                print(f"{color_red}Rollout {rollout_idx+1}/{num_rollouts} | Step 1 | {color_reset}Search Error:{color_reset} {e}")
         else:
             rewards["step1_search_call_format"] -= 0.5
             step1_failed = True
             rollout_stats["error_type"] = "Search Format Error"
             full_dialog_text_for_log += "**Search Call:** Failed (Format Error)\n"
-            print(f"Rollout {rollout_idx+1}/{num_rollouts} | Step 1 | {COLOR_RED}Search Call Format Error{COLOR_RESET}")
+            print(f"{color_red}Rollout {rollout_idx+1}/{num_rollouts} | Step 1 | {color_reset}Search Call Format Error{color_reset}")
 
         # Шаг 2: Формирование ответа
         if not step1_failed and actual_search_result is not None:
@@ -152,19 +228,19 @@ def rollout(
                     rewards["step2_answer_content"] += 1.0
                     rollout_stats["is_correct_answer"] = True
                     group_stats["answer_correct_count"] += 1
-                    print(f"Rollout {rollout_idx+1}/{num_rollouts} | Step 2 | {COLOR_GREEN}Answer OK:{COLOR_RESET} {final_answer} (matches oracle: {oracle_answer})")
+                    print(f"{color_green}Rollout {rollout_idx+1}/{num_rollouts} | Step 2 | {color_reset}Answer OK:{color_reset} {final_answer} (matches oracle: {oracle_answer})")
                 else:
                     rewards["step2_answer_content"] -= 0.5
                     rollout_stats["error_type"] = "Answer Content Mismatch"
-                    print(f"Rollout {rollout_idx+1}/{num_rollouts} | Step 2 | {COLOR_YELLOW}Answer Content Mismatch:{COLOR_RESET} Got '{final_answer}', Expected '{oracle_answer}'")
+                    print(f"{color_yellow}Rollout {rollout_idx+1}/{num_rollouts} | Step 2 | {color_reset}Answer Content Mismatch:{color_reset} Got '{final_answer}', Expected '{oracle_answer}'")
             else:
                 rewards["step2_answer_format"] -= 0.8
                 rollout_stats["error_type"] = "Answer Format Error"
                 full_dialog_text_for_log += "**Final Answer:** Failed (Format Error)\n"
-                print(f"Rollout {rollout_idx+1}/{num_rollouts} | Step 2 | {COLOR_RED}Answer Format Error:{COLOR_RESET} {completion_step2[:50]}...")
+                print(f"{color_red}Rollout {rollout_idx+1}/{num_rollouts} | Step 2 | {color_reset}Answer Format Error:{color_reset} {completion_step2[:50]}...")
         else:
             full_dialog_text_for_log += "**Step 2:** Skipped\n"
-            print(f"Rollout {rollout_idx+1}/{num_rollouts} | Step 2 | {COLOR_YELLOW}Skipped{COLOR_RESET}")
+            print(f"{color_yellow}Rollout {rollout_idx+1}/{num_rollouts} | Step 2 | {color_reset}Skipped{color_reset}")
 
         total_reward = sum(rewards.values())
         group_stats["total_reward_sum"] += total_reward
@@ -204,7 +280,7 @@ def rollout(
 
     # Паддинг и создание маски
     if not all_sequences:
-        print(f"{COLOR_YELLOW}WARNING: No valid sequences generated in this group.{COLOR_RESET}")
+        print(f"{color_yellow}WARNING: No valid sequences generated in this group.{color_reset}")
         return torch.empty(0, 0, device="cuda"), \
                torch.empty(0, 1, device="cuda"), \
                torch.empty(0, 0, dtype=torch.bool, device="cuda"), \
@@ -212,7 +288,7 @@ def rollout(
 
     non_empty_sequences = [seq for seq in all_sequences if seq.numel() > 0]
     if not non_empty_sequences:
-        print(f"{COLOR_YELLOW}WARNING: All sequences in the group are empty.{COLOR_RESET}")
+        print(f"{color_yellow}WARNING: All sequences in the group are empty.{color_reset}")
         return torch.empty(0, 0, device="cuda"), \
                torch.empty(0, 1, device="cuda"), \
                torch.empty(0, 0, dtype=torch.bool, device="cuda"), \

@@ -1,5 +1,11 @@
 """
-Модуль для поиска по документам с использованием FAISS.
+Модуль для поиска по документам с использованием FAISS и предварительно обученных эмбеддингов.
+
+Основные функции:
+- Инициализация и управление векторным хранилищем FAISS.
+- Генерация эмбеддингов для документов и запросов с помощью `CustomHuggingFaceEmbeddings`.
+- Выполнение семантического поиска по индексированным документам.
+- Загрузка и предоставление доступа к набору данных вопросов и ответов (QA).
 """
 
 import pickle
@@ -16,8 +22,22 @@ import torch.nn.functional as F
 
 # Глобальная переменная для хранения vectorstore
 vectorstore = None
+"""Глобальная переменная для хранения экземпляра векторного хранилища FAISS."""
 
 class CustomHuggingFaceEmbeddings:
+    """
+    Класс для генерации текстовых эмбеддингов с использованием моделей Hugging Face.
+
+    Этот класс оборачивает модели-трансформеры (по умолчанию "sentence-transformers/all-MiniLM-L6-v2")
+    для создания векторных представлений текстов. Поддерживает батчинг и перемещение на GPU,
+    если доступно. Реализует методы `embed_documents` для списков текстов и `embed_query` для
+    одиночного текста, а также метод `__call__` для совместимости.
+
+    Атрибуты:
+        tokenizer (AutoTokenizer): Токенизатор из Hugging Face.
+        model (AutoModel): Модель-трансформер из Hugging Face для генерации эмбеддингов.
+        device (torch.device): Устройство, на котором выполняется модель (CPU или CUDA).
+    """
     def __init__(self, model_name="sentence-transformers/all-MiniLM-L6-v2"):
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.model = AutoModel.from_pretrained(model_name)
@@ -26,11 +46,31 @@ class CustomHuggingFaceEmbeddings:
         self.device = next(self.model.parameters()).device
         
     def _average_pool(self, last_hidden_states, attention_mask):
+        """
+        Выполняет average pooling для выходных скрытых состояний модели-трансформера,
+        учитывая маску внимания.
+
+        Args:
+            last_hidden_states (torch.Tensor): Последние скрытые состояния модели.
+            attention_mask (torch.Tensor): Маска внимания для токенов.
+
+        Returns:
+            torch.Tensor: Усредненные эмбеддинги.
+        """
         last_hidden = last_hidden_states.masked_fill(~attention_mask[..., None].bool(), 0.0)
         return last_hidden.sum(dim=1) / attention_mask.sum(dim=1)[..., None]
         
     def embed_documents(self, texts: List[str]) -> List[List[float]]:
-        """Используется для векторизации документов/чанков"""
+        """
+        Генерирует эмбеддинги для списка документов (текстов).
+        Используется для индексации документов в векторном хранилище.
+
+        Args:
+            texts (List[str]): Список текстовых документов.
+
+        Returns:
+            List[List[float]]: Список эмбеддингов, где каждый эмбеддинг - это список float.
+        """
         embeddings = []
         batch_size = 32
         for i in range(0, len(texts), batch_size):
@@ -46,7 +86,16 @@ class CustomHuggingFaceEmbeddings:
         return embeddings
     
     def embed_query(self, text: str) -> List[float]:
-        """Используется для векторизации запроса"""
+        """
+        Генерирует эмбеддинг для одиночного текстового запроса.
+        Используется для векторизации поискового запроса перед поиском схожих документов.
+
+        Args:
+            text (str): Текстовый запрос.
+
+        Returns:
+            List[float]: Эмбеддинг запроса в виде списка float.
+        """
         inputs = self.tokenizer([text], padding=True, truncation=True, return_tensors="pt")
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
         
@@ -57,14 +106,37 @@ class CustomHuggingFaceEmbeddings:
             return embedding.cpu().numpy().tolist()[0]
             
     # Для совместимости с интерфейсом Embeddings
-    def __call__(self, texts: List[str]) -> List[List[float]]:
-        """Обеспечивает обратную совместимость с интерфейсом вызова функции"""
+    def __call__(self, texts: Union[str, List[str]]) -> Union[List[float], List[List[float]]]:
+        """
+        Обеспечивает вызов экземпляра класса как функции.
+        Если на вход подается строка, вызывает `embed_query`.
+        Если на вход подается список строк, вызывает `embed_documents`.
+
+        Args:
+            texts (Union[str, List[str]]): Текст или список текстов.
+
+        Returns:
+            Union[List[float], List[List[float]]]: Эмбеддинг или список эмбеддингов.
+        """
         if isinstance(texts, str):
             return self.embed_query(texts)
         return self.embed_documents(texts)
 
 def init_vectorstore(force_rebuild=False):
-    """Инициализировать или загрузить векторное хранилище"""
+    """
+    Инициализирует или загружает векторное хранилище FAISS.
+
+    Пытается загрузить предварительно сохраненные чанки документов из `qa_generated_data/chunks.pkl`.
+    Если файл чанков существует, создает или пересоздает индекс FAISS на их основе.
+    Результат сохраняется в глобальной переменной `vectorstore`.
+
+    Args:
+        force_rebuild (bool): Если True, принудительно пересоздает индекс, даже если он мог бы быть загружен
+                              (текущая реализация всегда пересоздает из чанков).
+
+    Returns:
+        Optional[FAISS]: Экземпляр FAISS, если инициализация прошла успешно, иначе None.
+    """
     global vectorstore
     
     try:
@@ -95,12 +167,19 @@ def init_vectorstore(force_rebuild=False):
 
 def search(query: str, k: int = 3) -> List[Dict[str, Any]]:
     """
-    Поиск похожих документов на основе запроса
+    Выполняет поиск похожих документов в векторном хранилище FAISS по заданному запросу.
+
+    Если векторное хранилище `vectorstore` еще не инициализировано, пытается его инициализировать
+    вызовом `init_vectorstore()`.
+
     Args:
-        query: Текстовый запрос
-        k: Количество документов для возврата
+        query (str): Текстовый запрос для поиска.
+        k (int): Количество наиболее похожих документов для возврата.
+
     Returns:
-        List[Dict]: Список документов с метаданными и оценками релевантности
+        List[Dict[str, Any]]: Список словарей, где каждый словарь представляет найденный документ
+        и содержит ключи 'content' (текст документа), 'metadata' (метаданные) и 'score' (оценка схожести).
+        В случае отсутствия `vectorstore` или ошибки поиска, возвращает список с одним элементом-ошибкой.
     """
     global vectorstore
     
@@ -131,9 +210,22 @@ def search(query: str, k: int = 3) -> List[Dict[str, Any]]:
 
 # Инициализируем векторное хранилище при импорте модуля
 init_vectorstore()
+"""Инициализация векторного хранилища при импорте модуля."""
 
 def load_qa_data():
-    """Загрузка предварительно сгенерированных вопросов и фрагментов документов"""
+    """
+    Загружает предварительно сгенерированные данные для вопросов и ответов (QA).
+
+    Данные включают:
+    - Чанки документов из `qa_generated_data/chunks.pkl`.
+    - Пары вопрос-ответ из `qa_generated_data/questions.json`.
+
+    Пути к файлам определяются относительно директории текущего файла (`__file__`).
+
+    Returns:
+        Tuple[Optional[List[Any]], Optional[List[Dict]]]: Кортеж (chunks, questions).
+        Возвращает (None, None) в случае ошибки загрузки.
+    """
     try:
         # Получение абсолютных путей к файлам данных
         base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -167,20 +259,27 @@ try:
 except Exception as e:
     print(f"Ошибка при инициализации данных QA: {e}")
     chunks, questions = None, None
+"""Глобальные переменные для хранения загруженных чанков и вопросов."""
 
 def get_question_answer(idx: Optional[int] = None, return_both: bool = True) -> Union[dict, str]:
     """
-    Получение пары вопрос-ответ либо по индексу, либо случайным образом.
-    
+    Получает пару вопрос-ответ (или только вопрос) из загруженного набора `questions`.
+
+    Можно получить QA-пару по конкретному индексу или случайную, если индекс не указан.
+
     Args:
-        idx: Индекс вопроса для получения (если None, выбирается случайный вопрос)
-        return_both: Возвращать ли и вопрос, и ответ (по умолчанию: True)
-        
+        idx (Optional[int]): Индекс вопроса для извлечения. Если None, выбирается случайный вопрос.
+        return_both (bool): Если True (по умолчанию), возвращает словарь {"question": q, "answer": a}.
+                            Если False, возвращает только строку с вопросом.
+
     Returns:
-        Вопрос и ответ как кортеж, если return_both=True, иначе только вопрос
+        Union[dict, str]: Словарь с вопросом и ответом или строка с вопросом.
+
+    Raises:
+        ValueError: Если данные `questions` не были загружены или индекс вне допустимого диапазона.
     """
     if questions is None:
-        raise ValueError("Вопросы не загружены. Убедитесь, что questions.json существует.")
+        raise ValueError("Вопросы не загружены. Убедитесь, что qa_generated_data/questions.json существует и доступен.")
         
     if idx is None:
         # Выбор случайного вопроса
@@ -200,9 +299,17 @@ def get_question_answer(idx: Optional[int] = None, return_both: bool = True) -> 
         return question
 
 def get_question_count() -> int:
-    """Получение общего количества доступных вопросов"""
+    """
+    Возвращает общее количество доступных вопросов в загруженном наборе `questions`.
+
+    Returns:
+        int: Количество вопросов.
+
+    Raises:
+        ValueError: Если данные `questions` не были загружены.
+    """
     if questions is None:
-        raise ValueError("Вопросы не загружены. Убедитесь, что questions.json существует.")
+        raise ValueError("Вопросы не загружены. Убедитесь, что qa_generated_data/questions.json существует и доступен.")
     return len(questions)
 
 def get_qa_dataset():
@@ -216,10 +323,10 @@ def get_qa_dataset():
     Дополнительные ключи из исходных данных вопросов также будут включены.
 
     Returns:
-        Объект Dataset HuggingFace.
+        Tuple[Dataset, Dataset]: Кортеж, содержащий тренировочный и тестовый датасеты HuggingFace.
     """
     if questions is None:
-        raise ValueError("Вопросы не загружены. Убедитесь, что questions.json существует.")
+        raise ValueError("Вопросы не загружены. Убедитесь, что qa_generated_data/questions.json существует и доступен.")
     
     qa_dataset = Dataset.from_list(questions)
     full_dataset = qa_dataset.shuffle(seed=42)

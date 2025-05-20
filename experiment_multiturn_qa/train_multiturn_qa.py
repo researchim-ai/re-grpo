@@ -1,4 +1,8 @@
 # -*- coding: utf-8 -*-
+"""
+Скрипт для обучения модели в задаче многоэтапных вопросов и ответов (multiturn QA).
+Включает поддержку инструментов, логирование и различные конфигурации обучения.
+"""
 import os
 # так можно выбирать устройство для запуска LLM
 # os.environ["CUDA_VISIBLE_DEVICES"] = "1"
@@ -50,6 +54,11 @@ class Logger:
     """
     Универсальный логгер с поддержкой wandb и tensorboard.
     Автоматически создает имя запуска/директории на основе имени скрипта и времени.
+
+    Атрибуты:
+        use_wandb (bool): Использовать ли Weights & Biases для логирования.
+        writer (SummaryWriter): Экземпляр SummaryWriter для TensorBoard, если use_wandb=False.
+        run_name (str): Уникальное имя для текущего запуска.
     """
     def __init__(self, script_name: str, use_wandb: bool = False, log_root_dir: str = "logs", wandb_project: str = "tiny_grpo", config: Optional[Dict] = None):
         self.use_wandb = use_wandb
@@ -144,7 +153,19 @@ TOOLS = {}
 
 def register_tool(name: str):
     """
-    Декоратор для регистрации инструмента по имени.
+    Декоратор для регистрации инструмента (функции) по заданному имени.
+    Зарегистрированные инструменты сохраняются в глобальном словаре TOOLS.
+
+    Пример:
+        @register_tool("my_tool")
+        def my_tool_function(arg1):
+            return f"Tool called with {arg1}"
+
+    Args:
+        name (str): Имя, под которым инструмент будет зарегистрирован.
+
+    Returns:
+        Callable: Декоратор, который регистрирует функцию.
     """
     def decorator(func):
         TOOLS[name] = func
@@ -155,7 +176,14 @@ def register_tool(name: str):
 def calc_tool(expression: str) -> str:
     """
     Простой инструмент для вычисления арифметических выражений.
-    Используется eval, в реальном продакшене нужно быть осторожным.
+    Использует `eval()` для вычисления, что может быть небезопасно.
+    В реальном продакшене следует использовать более безопасные методы парсинга и вычисления.
+
+    Args:
+        expression (str): Строка с арифметическим выражением (например, "2 + 2 * 3").
+
+    Returns:
+        str: Результат вычисления или сообщение об ошибке.
     """
     try:
         # Добавим простую очистку, но основная логика форматирования должна быть на LLM
@@ -173,7 +201,14 @@ def calc_tool(expression: str) -> str:
 @register_tool("search")
 def search_tool(query: str) -> str:
     """
-    Инструмент для поиска информации по запросу.
+    Инструмент для выполнения поиска информации по заданному запросу.
+    Использует модуль `search_module` для выполнения поиска.
+
+    Args:
+        query (str): Поисковый запрос.
+
+    Returns:
+        str: Отформатированные результаты поиска или сообщение об ошибке/отсутствии результатов.
     """
     try:
         if not query.strip():
@@ -203,9 +238,24 @@ def search_tool(query: str) -> str:
 # --- Изменяем detect_and_call_tools ---
 def detect_and_call_tools(generated_text: str) -> Optional[Tuple[str, str, str]]:
     """
-    Находит *первый* вызов инструмента, выполняет его и возвращает кортеж:
-    (tool_name, tool_input, tool_result_str).
-    Возвращает None, если инструмент не найден или не вызывался.
+    Обнаруживает и выполняет *первый* вызов инструмента в сгенерированном тексте.
+    Инструменты должны быть размечены тегами <tool:TOOL_NAME>INPUT_STRING</tool>.
+
+    Пример использования:
+        text_with_tool_call = "Какой-то текст <tool:calc>2+2</tool> еще текст."
+        result = detect_and_call_tools(text_with_tool_call)
+        if result:
+            tool_name, tool_input, tool_output = result
+            print(f"Tool: {tool_name}, Input: {tool_input}, Output: {tool_output}")
+            # Tool: calc, Input: 2+2, Output: 4
+
+    Args:
+        generated_text (str): Текст, в котором осуществляется поиск вызова инструмента.
+
+    Returns:
+        Optional[Tuple[str, str, str]]: Кортеж (tool_name, tool_input, tool_result_str),
+        если инструмент найден и выполнен. tool_result_str содержит результат выполнения
+        или сообщение об ошибке. Возвращает None, если инструмент не найден.
     """
     pattern = r"<tool:(\w+)>(.*?)</tool>"
     match = re.search(pattern, generated_text, flags=re.DOTALL)
@@ -242,6 +292,21 @@ def load_model(
     use_4bit: bool = True,
     use_lora: bool = True,
 ) -> tuple[AutoModelForCausalLM, PreTrainedTokenizer]:
+    """
+    Загружает языковую модель и токенизатор с использованием Hugging Face Transformers.
+    Поддерживает квантизацию (4-bit), LoRA и другие конфигурации.
+
+    Args:
+        model_name_or_path (str): Имя или путь к модели Hugging Face.
+        trust_remote_code (bool): Доверять ли удаленному коду при загрузке модели.
+        bf16 (bool): Использовать ли bf16 для ускорения (если доступно).
+        device_map (Optional[Any]): Карта устройств для распределения модели.
+        use_4bit (bool): Использовать ли 4-битную квантизацию с BitsAndBytes.
+        use_lora (bool): Использовать ли PEFT LoRA для адаптации модели.
+
+    Returns:
+        tuple[AutoModelForCausalLM, PreTrainedTokenizer]: Кортеж с загруженной моделью и токенизатором.
+    """
     tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
     tokenizer.pad_token = tokenizer.eos_token
 
@@ -296,6 +361,10 @@ def load_model(
     return model, tokenizer
 
 system_prompt = """You are a helpful assistant that can search and provide answers to questions. Your responses should be accurate, concise, and based on the search results."""
+"""
+Системный промпт, определяющий роль и поведение языковой модели как ассистента,
+способного использовать поиск для ответов на вопросы.
+"""
 
 # Первый системный промпт - для поиска информации
 first_step_prompt = """- Think about how to answer the user's question
@@ -311,6 +380,11 @@ What happened during the Apollo 13 mission?
 
 Your task:
 """
+"""
+Промпт для первого этапа генерации: модель должна проанализировать вопрос пользователя
+и сформировать вызов инструмента поиска (<tool:search>query</tool>).
+Включает пример ожидаемого формата.
+"""
 
 # Второй системный промпт - для формулировки ответа на основе результатов поиска
 second_step_prompt = """Based on the search results, provide a clear and concise answer.
@@ -325,22 +399,55 @@ Search results: Paris is the capital of France
 
 Here are the search results:
 """
+"""
+Промпт для второго этапа генерации: модель должна на основе предоставленных результатов поиска
+сформулировать краткий и точный ответ, обернув его в теги <answer>...</answer>.
+Включает пример ожидаемого формата.
+"""
 
 @torch.no_grad()
 def rollout(
     model: AutoModelForCausalLM,
     tokenizer: PreTrainedTokenizer,
-    task: str,
-    oracle_answer: str,
-    num_rollouts: int,
-    logger: Logger, # Принимаем объект Logger
-    global_step: int,
-    max_length: int = 2048,
-    temperature: float = 0.7,
-    top_p: float = 1.0,
+    task: str, # Сам вопрос пользователя
+    oracle_answer: str, # Ожидаемый правильный ответ (строка)
+    num_rollouts: int, # Количество "прогонов" для текущей задачи
+    logger: Logger, # Экземпляр логгера для записи метрик и примеров
+    global_step: int, # Текущий глобальный шаг обучения для логгирования
+    max_length: int = 2048, # Максимальная длина генерируемой последовательности
+    temperature: float = 0.7, # Температура для семплирования при генерации
+    top_p: float = 1.0, # Top-p (nucleus) семплирование при генерации
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[str]]:
+    """
+    Выполняет несколько "прогонов" (rollouts) модели для заданной задачи (task).
+    Каждый прогон включает два этапа:
+    1. Генерация вызова инструмента (например, поиска) для сбора информации.
+    2. Генерация ответа на основе результатов работы инструмента.
 
-    model.eval()
+    Функция оценивает корректность вызова инструмента, формата ответа и его содержания
+    по сравнению с `oracle_answer`. Собирает и логирует подробную статистику и примеры.
+
+    Args:
+        model: Обучаемая языковая модель.
+        tokenizer: Токенизатор для модели.
+        task: Входной вопрос пользователя, для которого выполняется прогон.
+        oracle_answer: Эталонный (правильный) ответ на вопрос.
+        num_rollouts: Количество прогонов, выполняемых для данного `task`.
+        logger: Экземпляр класса `Logger` для логирования метрик и отладочной информации.
+        global_step: Глобальный шаг обучения, используется для логирования.
+        max_length: Максимальная общая длина последовательности (промпт + генерация).
+        temperature: Температура для управления случайностью генерации.
+        top_p: Параметр top-p для nucleus sampling при генерации.
+
+    Returns:
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[str]]:
+            - all_log_probs (torch.Tensor): Тензор с логарифмами вероятностей всех сгенерированных токенов.
+            - all_rewards (torch.Tensor): Тензор с наградами для каждого шага в каждом прогоне.
+            - all_masks (torch.Tensor): Маска, указывающая на валидные (не padding) токены.
+            - all_completions_text (list[str]): Список полных диалогов (промпты + генерация) для всех прогонов.
+    """
+
+    model.eval() # Переводим модель в режим оценки
     all_sequences = []
     all_completions_text = []
     all_rewards_dicts = []
@@ -598,6 +705,13 @@ def rollout(
 
 
 def init_rng(seed: int):
+    """
+    Инициализирует генераторы случайных чисел для `random`, `numpy` (если используется)
+    и `torch` для обеспечения воспроизводимости экспериментов.
+
+    Args:
+        seed (int): Начальное значение для генераторов случайных чисел.
+    """
     random.seed(seed)
     torch.manual_seed(seed)
     # Дополнительно для GPU, если используется
@@ -609,14 +723,36 @@ def init_rng(seed: int):
         # torch.backends.cudnn.benchmark = False
 
 def group_advantages(returns: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
-    """Нормализует преимущества в группе."""
+    """
+    Нормализует тензор "преимуществ" (returns) путем вычитания среднего
+    и деления на стандартное отклонение. Добавляет `eps` к знаменателю
+    для численной стабильности.
+
+    Args:
+        returns (torch.Tensor): Тензор значений преимуществ (например, наград).
+        eps (float): Малое значение для предотвращения деления на ноль.
+
+    Returns:
+        torch.Tensor: Нормализованный тензор преимуществ.
+    """
     return (returns - returns.mean()) / (returns.std() + eps)
 
 
 def sequence_log_probs_from_logits(
     logits: torch.tensor, output_ids: torch.tensor
 ) -> torch.Tensor:
-    """Вычисляет лог-вероятности для последовательности токенов."""
+    """
+    Вычисляет логарифмические вероятности (log probabilities) для последовательности
+    предсказанных токенов (`output_ids`) на основе выходных логитов модели.
+
+    Args:
+        logits (torch.Tensor): Тензор логитов с выхода модели, форма (batch_size, seq_len, vocab_size).
+        output_ids (torch.Tensor): Тензор ID истинных или сгенерированных токенов, форма (batch_size, seq_len).
+
+    Returns:
+        torch.Tensor: Тензор логарифмических вероятностей для каждого токена в `output_ids`,
+                      форма (batch_size, seq_len).
+    """
     log_prob = F.log_softmax(logits, dim=-1)
     # Используем gather для выбора лог-вероятностей нужных токенов
     return log_prob.gather(dim=-1, index=output_ids.unsqueeze(-1)).squeeze(-1)
@@ -624,10 +760,28 @@ def sequence_log_probs_from_logits(
 
 def sequences_log_probs(
     model: AutoModelForCausalLM,
-    sequence_ids: torch.Tensor,
-    attention_mask: torch.Tensor,
+    sequence_ids: torch.Tensor, # Токены input_ids для модели
+    attention_mask: torch.Tensor, # Маска внимания
 ) -> torch.Tensor:
-    """Получает лог-вероятности для всех токенов в батче последовательностей."""
+    """
+    Вычисляет логарифмические вероятности для каждой последовательности токенов в батче,
+    используя прямой проход через модель. Возвращает логарифмические вероятности
+    *только для сгенерированных токенов (действий)*, не для промпта.
+
+    Args:
+        model (AutoModelForCausalLM): Языковая модель.
+        sequence_ids (torch.Tensor): Батч последовательностей токенов (input_ids),
+                                     включая промпт и сгенерированную часть.
+                                     Форма: (batch_size, sequence_length).
+        attention_mask (torch.Tensor): Маска внимания для `sequence_ids`.
+                                        Форма: (batch_size, sequence_length).
+
+    Returns:
+        torch.Tensor: Тензор логарифмических вероятностей для каждого токена в каждой
+                      последовательности. Форма: (batch_size, sequence_length - 1).
+                      Обратите внимание, что возвращаются логиты для предсказания
+                      *следующего* токена, поэтому длина на 1 меньше.
+    """
     # Создаем position_ids для корректной работы attention
     position_ids = attention_mask.long().cumsum(dim=-1) - 1
     position_ids.masked_fill_(mask=(attention_mask == 0), value=1) # Заменяем 0 на 1 там где маска 0?
@@ -656,6 +810,22 @@ def read_prompts(
     predicate: Optional[Callable[[Any], bool]] = None,
     max_rows: Optional[int] = None,
 ) -> list:
+    """
+    Читает строки (промпты/задачи) из JSON-файла.
+    Каждая строка в файле предполагается словарём.
+
+    Args:
+        file_name (str): Путь к JSON-файлу с данными.
+        predicate (Optional[Callable[[Any], bool]]): Необязательная функция-предикат
+            для фильтрации строк. Если None, все строки загружаются.
+            Предикат принимает один аргумент (строку/словарь из файла) и возвращает True, если строка должна быть включена.
+        max_rows (Optional[int]): Максимальное количество строк для загрузки.
+            Если None, загружаются все строки, удовлетворяющие предикату.
+
+    Returns:
+        list: Список загруженных и отфильтрованных строк (словарей).
+              Возвращает пустой список в случае ошибки чтения или парсинга файла.
+    """
     rows = []
     count = 0
     try:
@@ -683,6 +853,16 @@ def read_prompts(
 def parse_args():
     # Определяем имя скрипта для логгера
     script_name = Path(__file__).stem
+    """
+    Парсит аргументы командной строки для скрипта обучения.
+
+    Использует argparse для определения и разбора аргументов, таких как
+    имя запуска, директории логов, параметры модели, пути к данным и гиперпараметры обучения.
+
+    Returns:
+        argparse.Namespace: Объект с распарсенными аргументами командной строки.
+                            Также добавляет атрибут `script_name`.
+    """
 
     parser = argparse.ArgumentParser(description='Train a model with GRPO for multi-turn tool calling.')
     parser.add_argument('--run-name', type=str, default=None, help='Custom run name for logging (overrides auto-generated)')
@@ -710,6 +890,29 @@ def parse_args():
     return args
 
 def main():
+    """
+    Основная функция для запуска процесса обучения модели.
+
+    Выполняет следующие шаги:
+    1. Парсинг аргументов командной строки.
+    2. Инициализация логгера (WandB или TensorBoard).
+    3. Установка CUDA устройства и инициализация RNG.
+    4. Загрузка референсной и основной (обучаемой) моделей и токенизатора.
+    5. Инициализация оптимизатора.
+    6. Загрузка и подготовка данных (промптов).
+    7. Создание буфера воспроизведения (ReplayBuffer) и функции потерь (GRPOLoss).
+    8. Запуск основного цикла обучения:
+        a. Генерация "прогонов" (rollouts) для сбора опыта (задачи, действия, награды).
+        b. Добавление опыта в ReplayBuffer.
+        c. Обучение модели на батчах из ReplayBuffer:
+            i. Вычисление логарифмических вероятностей для старых и новых политик.
+            ii. Расчет функции потерь GRPO.
+            iii. Шаг оптимизации.
+        d. Логирование метрик (потери, награды, специфичные для GRPO метрики).
+        e. Периодическое сохранение чекпоинтов модели.
+        f. Периодическое логирование примеров сгенерированных диалогов.
+    9. Закрытие логгера по завершении обучения.
+    """
     args = parse_args()
 
     seed = args.seed
