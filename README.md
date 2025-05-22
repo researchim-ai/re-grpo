@@ -78,6 +78,19 @@ This script also accepts command-line arguments. Use `--help` to see available o
 python experiment_multiturn_qa/train_multiturn_qa.py --help
 ```
 
+**6. Dr. GRPO Experiment (GRPO with Debiasing Techniques)**
+
+This directory `experiment_drgrpo` contains an implementation of GRPO with modifications inspired by "Dr. GRPO" to mitigate certain biases.
+The key changes are:
+- **Length Bias Removal**: The critic's value aggregation is modified to use a masked sum with a constant normalizer (based on `generate_max_length`) instead of a simple masked mean. This is controlled by the `critic_type="drgrpo"` parameter in the `GRPOLoss` class and related configuration in `train.py`.
+- **Difficulty Bias Removal**: The Monte Carlo advantage calculation is adjusted to not normalize by the standard deviation of rewards when `critic_type="drgrpo"`. This change is implemented in the `group_advantages` function in `train.py`.
+
+These modifications aim to improve the robustness and performance of the GRPO algorithm.
+To run this experiment:
+```bash
+python experiment_drgrpo/train.py
+```
+
 ### Inspiration
 
 - [OpenRLHF](https://github.com/OpenRLHF/OpenRLHF)
