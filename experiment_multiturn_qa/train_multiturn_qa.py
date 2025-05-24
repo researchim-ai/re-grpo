@@ -867,8 +867,9 @@ def parse_args():
     parser = argparse.ArgumentParser(description='Train a model with GRPO for multi-turn tool calling.')
     parser.add_argument('--run-name', type=str, default=None, help='Custom run name for logging (overrides auto-generated)')
     parser.add_argument('--log-dir', type=str, default="runs", help='Root directory for logs')
-    parser.add_argument('--wandb', action='store_true', help='Use WandB for logging')
-    parser.add_argument('--wandb-project', type=str, default="tiny_grpo_v2", help='WandB project name')
+    parser.add_argument('--wandb', action='store_true', default=True, help='Use WandB for logging (enabled by default)')
+    parser.add_argument('--no-wandb', action='store_true', help='Disable WandB logging')
+    parser.add_argument('--wandb-project', type=str, default="tiny_grpo_multiturn_qa", help='WandB project name')
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
     parser.add_argument('--device-index', type=int, default=0, help='CUDA device index')
     parser.add_argument('--model-name', type=str, default="Qwen/Qwen2.5-3B-Instruct", help='Model name or path')
@@ -943,10 +944,13 @@ def main():
     # Собираем конфиг для логгера
     run_config = vars(args) # Преобразуем Namespace в dict
 
+    # Обработка флагов wandb
+    use_wandb = args.wandb and not args.no_wandb
+
     # --- Инициализация логгера ---
     logger = Logger(
         script_name=args.script_name if args.run_name is None else Path(args.run_name).stem, # Используем имя скрипта или кастомное
-        use_wandb=args.wandb,
+        use_wandb=use_wandb,
         log_root_dir=args.log_dir,
         wandb_project=args.wandb_project,
         config=run_config # Передаем конфиг запуска

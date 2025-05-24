@@ -259,7 +259,7 @@ def read_prompts(
 
 def main():
     seed = 42
-    wandb_project = None  # "tiny_grpo"
+    wandb_project = "drgrpo_experiment"  # Включаем wandb по умолчанию
     device_index = 0
     model_name = "unsloth/Llama-3.2-1B-Instruct"
     checkpoint_path = Path("./output")
@@ -338,14 +338,51 @@ def main():
         generate_max_length=GENERATE_MAX_LENGTH 
     )
 
+    # Расширенная конфигурация для wandb
+    config = {
+        "model_name": model_name,
+        "learning_rate": lr,
+        "batch_size": train_batch_size,
+        "group_size": group_size,
+        "rollouts_per_step": rollouts_per_step,
+        "epochs_per_step": epochs_per_step,
+        "kl_weight": kl_weight,
+        "clip_eps": clip_eps,
+        "temperature": temperature,
+        "top_p": top_p,
+        "max_length": max_length,
+        "use_4bit": use_4bit,
+        "use_lora": use_lora,
+        "critic_type": CRITIC_TYPE,
+        "generate_max_length": GENERATE_MAX_LENGTH,
+        "algorithm": "DR-GRPO"
+    }
+
     if wandb_project is None:
         wandb.init(mode="disabled")
     else:
-        wandb.init(project=wandb_project)
+        wandb.init(project=wandb_project, config=config)
+        # Добавляем отладочное логирование сразу после инициализации
+        print(f"✓ WandB инициализирован для проекта: {wandb_project}")
+        print(f"✓ Конфиг: {config}")
+        # Логируем начальные метрики для подтверждения работы
+        wandb.log({
+            "debug/initialization": 1.0,
+            "debug/algorithm": "DR-GRPO",
+            "debug/critic_type": CRITIC_TYPE,
+        }, step=0)
+        print("✓ Отладочные метрики отправлены в WandB")
+
+    global_step = 0
+    best_mean_return = float('-inf')
+    total_rollouts = 0
 
     for k, prompt_batch in enumerate(prompt_loader):
+        print(f"\n🔥 DR-GRPO BATCH {k+1} - НАЧИНАЕМ ЛОГИРОВАНИЕ РАСШИРЕННЫХ МЕТРИК")
         rollout_returns = []
-
+        batch_advantages = []
+        batch_kl_divergences = []
+        batch_dr_advantages = []  # Для отслеживания DR-GRPO специфичных метрик
         replay_buffer.clear()
 
         questions = prompt_batch["question"]
@@ -368,6 +405,7 @@ def main():
                     f"rollout q='{q}', a='{a}', returns={returns.sum().item():.2f}, replay_buffer_size={len(replay_buffer)}, sequence_ids={sequence_ids.shape}"
                 )
                 rollout_returns.append(returns.cpu())
+                total_rollouts += len(returns)
 
                 # Dr. GRPO Modification: Передаем CRITIC_TYPE в group_advantages
                 advantages = group_advantages(
@@ -375,6 +413,8 @@ def main():
                     eps=1e-8,
                     critic_type=CRITIC_TYPE 
                 )
+                batch_advantages.append(advantages.cpu())
+                batch_dr_advantages.append(advantages.cpu())  # Дополнительное отслеживание для DR-GRPO
 
                 attention_mask = sequence_ids != pad_token_id
 
@@ -393,6 +433,7 @@ def main():
                     log_probs_ref=log_probs_ref,
                     action_mask=action_mask,
                 )
+                batch_kl_divergences.append(kl.cpu())
 
                 experience = Experience(
                     sequences=sequence_ids,
@@ -407,9 +448,82 @@ def main():
                 replay_buffer.append(experience.to(cpu_device))
 
         torch.cuda.empty_cache()
-        episode_return_sum = torch.stack(rollout_returns).sum()
+        
+        # Вычисляем агрегированные метрики для роллаутов
+        all_returns = torch.cat(rollout_returns)  # Объединяем все returns
+        episode_return_sum = all_returns.sum()
+        episode_return_mean = all_returns.mean()
+        episode_return_std = all_returns.std()
+        episode_return_max = all_returns.max()
+        episode_return_min = all_returns.min()
+        
+        # Обновляем лучший результат
+        if episode_return_mean > best_mean_return:
+            best_mean_return = episode_return_mean
+        
+        # KL дивергенция статистики
+        if batch_kl_divergences:
+            # Сплющиваем и объединяем тензоры разных размеров
+            all_kl_values = torch.cat([kl.flatten() for kl in batch_kl_divergences])
+            batch_kl_mean = all_kl_values.mean()
+            batch_kl_std = all_kl_values.std()
+            batch_kl_max = all_kl_values.max()
+        else:
+            batch_kl_mean = batch_kl_std = batch_kl_max = 0.0
+
+        # Преимущества статистики
+        if batch_advantages:
+            # Сплющиваем и объединяем тензоры разных размеров
+            all_advantages_values = torch.cat([adv.flatten() for adv in batch_advantages])
+            advantages_mean = all_advantages_values.mean()
+            advantages_std = all_advantages_values.std()
+            advantages_max = all_advantages_values.max()
+            advantages_min = all_advantages_values.min()
+        else:
+            advantages_mean = advantages_std = advantages_max = advantages_min = 0.0
+
+        # DR-GRPO специфичные метрики
+        if batch_dr_advantages:
+            # Сплющиваем и объединяем тензоры для DR-GRPO метрик
+            all_dr_advantages = torch.cat([adv.flatten() for adv in batch_dr_advantages])
+            dr_advantages_variance = all_dr_advantages.var()
+            dr_advantages_skewness = all_dr_advantages.std() / (all_dr_advantages.mean() + 1e-8)
+        else:
+            dr_advantages_variance = dr_advantages_skewness = 0.0
+
         print(f"returns of step {k}: {episode_return_sum:.4f}")
-        wandb.log({"returns": episode_return_sum})
+        
+        # Расширенное логирование роллаутов с DR-GRPO спецификой
+        print(f"📊 ЛОГИРУЕМ DR-GRPO МЕТРИКИ: advantages_variance={dr_advantages_variance:.4f}, critic_type={CRITIC_TYPE}")
+        wandb.log({
+            # Основные метрики возвратов
+            "rollouts/returns_sum": episode_return_sum,
+            "rollouts/returns_mean": episode_return_mean,
+            "rollouts/returns_std": episode_return_std,
+            "rollouts/returns_max": episode_return_max,
+            "rollouts/returns_min": episode_return_min,
+            "rollouts/returns_best_mean": best_mean_return,
+            
+            # KL дивергенция
+            "rollouts/kl_mean": batch_kl_mean,
+            "rollouts/kl_std": batch_kl_std,
+            "rollouts/kl_max": batch_kl_max,
+            
+            # Преимущества
+            "rollouts/advantages_mean": advantages_mean,
+            "rollouts/advantages_std": advantages_std,
+            "rollouts/advantages_max": advantages_max,
+            "rollouts/advantages_min": advantages_min,
+            
+            # DR-GRPO специфичные метрики
+            "dr_grpo/advantages_variance": dr_advantages_variance,
+            "dr_grpo/advantages_skewness": dr_advantages_skewness,
+            "dr_grpo/critic_type": CRITIC_TYPE,
+            
+            # Общие статистики
+            "rollouts/total_rollouts": total_rollouts,
+            "rollouts/batch_step": k + 1,
+        }, step=global_step)
 
         experience_sampler = DataLoader(
             replay_buffer,
@@ -419,6 +533,11 @@ def main():
             collate_fn=join_experience_batch,
         )
 
+        epoch_losses = []
+        epoch_kls = []
+        epoch_grad_norms = []
+        epoch_dr_loss_components = []  # Для отслеживания компонентов DR-GRPO loss
+        
         for step_epoch in range(epochs_per_step):
             model.train()
 
@@ -438,14 +557,76 @@ def main():
                 if not loss.isfinite():
                     print(f"Loss not finite, skipping backward, loss={loss}")
                     print(f"experience.advantages={exp.advantages}")
+                    # Логируем невалидные потери
+                    wandb.log({
+                        "training/invalid_loss_count": 1,
+                        "training/loss": float('inf'),
+                        "training/kl": float('inf'),
+                    }, step=global_step)
                     continue
 
                 loss.backward()
                 grad_norm = clip_grad_norm_(model.parameters(), max_norm=max_norm)
+                
+                # Собираем метрики эпохи
+                epoch_losses.append(loss.item())
+                epoch_kls.append(kl.item())
+                epoch_grad_norms.append(grad_norm.item() if torch.is_tensor(grad_norm) else grad_norm)
+                
+                # Можем добавить специфичные DR-GRPO компоненты
+                if hasattr(grpo_loss_fn, 'last_loss_components'):
+                    epoch_dr_loss_components.append(grpo_loss_fn.last_loss_components)
+                
                 print(f"{step_epoch}: kl={kl: .4f}, grad_norm={grad_norm: .4f}")
-                wandb.log({"kl": kl, "grad_norm": grad_norm})
+                
+                # Логирование на каждом шаге оптимизации
+                step_log = {
+                    "training_step/loss": loss.item(),
+                    "training_step/kl": kl.item(),
+                    "training_step/grad_norm": grad_norm.item() if torch.is_tensor(grad_norm) else grad_norm,
+                    "training_step/learning_rate": optimizer.param_groups[0]['lr'],
+                }
+                
+                # Добавляем DR-GRPO специфичные метрики если доступны
+                if hasattr(grpo_loss_fn, 'last_loss_components') and grpo_loss_fn.last_loss_components:
+                    step_log.update({f"training_step/dr_component_{k}": v 
+                                   for k, v in grpo_loss_fn.last_loss_components.items()})
+                
+                wandb.log(step_log, step=global_step)
 
                 optimizer.step()
+                global_step += 1
+
+        # Логирование средних значений по эпохе
+        if epoch_losses:
+            epoch_log = {
+                "training_epoch/loss_mean": sum(epoch_losses) / len(epoch_losses),
+                "training_epoch/loss_std": torch.tensor(epoch_losses).std().item(),
+                "training_epoch/kl_mean": sum(epoch_kls) / len(epoch_kls),
+                "training_epoch/kl_std": torch.tensor(epoch_kls).std().item(),
+                "training_epoch/grad_norm_mean": sum(epoch_grad_norms) / len(epoch_grad_norms),
+                "training_epoch/grad_norm_max": max(epoch_grad_norms),
+                "training_epoch/steps_per_epoch": len(epoch_losses),
+            }
+            
+            # Добавляем DR-GRPO epoch метрики если доступны
+            if epoch_dr_loss_components and epoch_dr_loss_components[0]:
+                for component_name in epoch_dr_loss_components[0].keys():
+                    component_values = [comp[component_name] for comp in epoch_dr_loss_components if component_name in comp]
+                    if component_values:
+                        epoch_log[f"training_epoch/dr_{component_name}_mean"] = sum(component_values) / len(component_values)
+            
+            wandb.log(epoch_log, step=global_step)
+
+        # Логирование информации о модели и памяти
+        if torch.cuda.is_available():
+            gpu_memory_allocated = torch.cuda.memory_allocated() / 1024**3  # GB
+            gpu_memory_reserved = torch.cuda.memory_reserved() / 1024**3   # GB
+            wandb.log({
+                "system/gpu_memory_allocated_gb": gpu_memory_allocated,
+                "system/gpu_memory_reserved_gb": gpu_memory_reserved,
+                "system/replay_buffer_size": len(replay_buffer),
+            }, step=global_step)
 
         if (
             checkpoint_path is not None
@@ -453,9 +634,26 @@ def main():
             and (k + 1) % checkpoint_interval == 0
         ):
             model.save_pretrained(checkpoint_path / f"step_{k}")
+            wandb.log({
+                "checkpoint/saved": 1,
+                "checkpoint/step": k + 1
+            }, step=global_step)
 
     if checkpoint_path is not None:
         model.save_pretrained(checkpoint_path / f"step_{k}")
+        wandb.log({
+            "checkpoint/final_saved": 1,
+            "training/completed": True
+        }, step=global_step)
+
+    # Финальное логирование
+    wandb.log({
+        "final/total_steps": global_step,
+        "final/total_batches": k + 1,
+        "final/total_rollouts": total_rollouts,
+        "final/best_mean_return": best_mean_return,
+        "final/algorithm": "DR-GRPO"
+    })
 
 
 if __name__ == "__main__":

@@ -224,7 +224,7 @@ def read_prompts(
 def main():
     accelerator = Accelerator(cpu=True)
     seed = 42
-    wandb_project = None
+    wandb_project = "accelerate_grpo"
     model_name = "unsloth/Llama-3.2-1B-Instruct"
     checkpoint_path = Path("./output")
     checkpoint_interval = 20
@@ -262,11 +262,37 @@ def main():
     replay_buffer = ReplayBuffer()
     objective = GRPOLoss(clip_eps=clip_eps, kl_weight=kl_weight)
 
-    wandb.init(mode="disabled" if wandb_project is None else wandb_project)
+    config = {
+        "model_name": model_name,
+        "learning_rate": lr,
+        "batch_size": train_batch_size,
+        "group_size": group_size,
+        "rollouts_per_step": rollouts_per_step,
+        "epochs_per_step": epochs_per_step,
+        "kl_weight": kl_weight,
+        "clip_eps": clip_eps,
+        "temperature": temperature,
+        "top_p": top_p,
+        "max_length": max_length,
+        "accelerator_device": str(accelerator.device),
+        "mixed_precision": str(accelerator.mixed_precision),
+        "algorithm": "GRPO-Accelerate"
+    }
+
+    if wandb_project is None:
+        wandb.init(mode="disabled")
+    else:
+        wandb.init(project=wandb_project, config=config)
+
+    global_step = 0
+    best_mean_return = float('-inf')
+    total_rollouts = 0
 
     for k, prompt_batch in enumerate(prompt_loader):
         replay_buffer.clear()
         rollout_returns = []
+        batch_advantages = []
+        batch_kl_divergences = []
 
         with torch.no_grad():
             for q, a in zip(prompt_batch["question"], prompt_batch["answer"]):
@@ -275,13 +301,17 @@ def main():
                 )
 
                 rollout_returns.append(returns.cpu())
+                total_rollouts += len(returns)
+                
                 advantages = group_advantages(returns)
+                batch_advantages.append(advantages.cpu())
                 attention_mask = sequence_ids != tokenizer.eos_token_id
 
                 log_probs = sequences_log_probs(model, sequence_ids, attention_mask)
                 log_probs_ref = sequences_log_probs(reference_model, sequence_ids, attention_mask)
 
                 kl = approx_kl_divergence(log_probs, log_probs_ref, action_mask)
+                batch_kl_divergences.append(kl.cpu())
 
                 replay_buffer.append(
                     Experience(
@@ -296,29 +326,134 @@ def main():
                     ).to("cpu")
                 )
 
-        episode_return_sum = torch.stack(rollout_returns).sum()
-        wandb.log({"returns": episode_return_sum})
+        all_returns = torch.cat(rollout_returns)
+        episode_return_sum = all_returns.sum()
+        episode_return_mean = all_returns.mean()
+        episode_return_std = all_returns.std()
+        episode_return_max = all_returns.max()
+        episode_return_min = all_returns.min()
+        
+        if episode_return_mean > best_mean_return:
+            best_mean_return = episode_return_mean
+        
+        if batch_kl_divergences:
+            all_kl_values = torch.cat([kl.flatten() for kl in batch_kl_divergences])
+            batch_kl_mean = all_kl_values.mean()
+            batch_kl_std = all_kl_values.std()
+            batch_kl_max = all_kl_values.max()
+        else:
+            batch_kl_mean = batch_kl_std = batch_kl_max = 0.0
+
+        if batch_advantages:
+            all_advantages_values = torch.cat([adv.flatten() for adv in batch_advantages])
+            advantages_mean = all_advantages_values.mean()
+            advantages_std = all_advantages_values.std()
+        else:
+            advantages_mean = advantages_std = 0.0
+
+        wandb.log({
+            "rollouts/returns_sum": episode_return_sum,
+            "rollouts/returns_mean": episode_return_mean,
+            "rollouts/returns_std": episode_return_std,
+            "rollouts/returns_max": episode_return_max,
+            "rollouts/returns_min": episode_return_min,
+            "rollouts/returns_best_mean": best_mean_return,
+            
+            "rollouts/kl_mean": batch_kl_mean,
+            "rollouts/kl_std": batch_kl_std,
+            "rollouts/kl_max": batch_kl_max,
+            
+            "rollouts/advantages_mean": advantages_mean,
+            "rollouts/advantages_std": advantages_std,
+            
+            "rollouts/total_rollouts": total_rollouts,
+            "rollouts/batch_step": k + 1,
+            "accelerate/device": str(accelerator.device),
+        }, step=global_step)
 
         experience_sampler = DataLoader(
             replay_buffer, batch_size=train_batch_size, shuffle=True, collate_fn=join_experience_batch
         )
 
+        epoch_losses = []
+        epoch_kls = []
+        epoch_grad_norms = []
+
         model.train()
-        for _ in range(epochs_per_step):
-            for exp in experience_sampler:
+        for exp in experience_sampler:
+            exp = exp.to(accelerator.device)
+
+            with accelerator.accumulate(model):
                 optimizer.zero_grad()
-                exp = exp.to(accelerator.device)
+
                 log_probs = sequences_log_probs(model, exp.sequences, exp.attention_mask)
                 loss, kl = objective(log_probs=log_probs, experience=exp)
+
+                if not loss.isfinite():
+                    print(f"Loss not finite, skipping backward, loss={loss}")
+                    wandb.log({
+                        "training/invalid_loss_count": 1,
+                        "training/loss": float('inf'),
+                        "training/kl": float('inf'),
+                    }, step=global_step)
+                    continue
+
                 accelerator.backward(loss)
-                clip_grad_norm_(model.parameters(), max_norm=max_norm)
+                
+                if accelerator.sync_gradients:
+                    grad_norm = accelerator.clip_grad_norm_(model.parameters(), max_norm)
+                else:
+                    grad_norm = 0.0
+                
+                epoch_losses.append(loss.item())
+                epoch_kls.append(kl.item())
+                epoch_grad_norms.append(grad_norm if isinstance(grad_norm, float) else grad_norm.item())
+                
+                wandb.log({
+                    "training_step/loss": loss.item(),
+                    "training_step/kl": kl.item(),
+                    "training_step/grad_norm": grad_norm if isinstance(grad_norm, float) else grad_norm.item(),
+                    "training_step/learning_rate": optimizer.param_groups[0]['lr'],
+                    "accelerate/sync_gradients": accelerator.sync_gradients,
+                }, step=global_step)
+
                 optimizer.step()
+                global_step += 1
 
-        if checkpoint_path and checkpoint_interval and (k + 1) % checkpoint_interval == 0:
-            accelerator.unwrap_model(model).save_pretrained(checkpoint_path / f"step_{k}")
+        if epoch_losses:
+            wandb.log({
+                "training_epoch/loss_mean": sum(epoch_losses) / len(epoch_losses),
+                "training_epoch/loss_std": torch.tensor(epoch_losses).std().item(),
+                "training_epoch/kl_mean": sum(epoch_kls) / len(epoch_kls),
+                "training_epoch/kl_std": torch.tensor(epoch_kls).std().item(),
+                "training_epoch/grad_norm_mean": sum(epoch_grad_norms) / len(epoch_grad_norms),
+                "training_epoch/grad_norm_max": max(epoch_grad_norms),
+                "training_epoch/steps_per_epoch": len(epoch_losses),
+            }, step=global_step)
 
-    if checkpoint_path:
-        accelerator.unwrap_model(model).save_pretrained(checkpoint_path / f"final")
+        if (checkpoint_path is not None and checkpoint_interval is not None and (k + 1) % checkpoint_interval == 0):
+            unwrapped_model = accelerator.unwrap_model(model)
+            unwrapped_model.save_pretrained(checkpoint_path / f"step_{k}")
+            wandb.log({
+                "checkpoint/saved": 1,
+                "checkpoint/step": k + 1
+            }, step=global_step)
+
+    if checkpoint_path is not None:
+        unwrapped_model = accelerator.unwrap_model(model)
+        unwrapped_model.save_pretrained(checkpoint_path / f"step_{k}")
+        wandb.log({
+            "checkpoint/final_saved": 1,
+            "training/completed": True
+        }, step=global_step)
+
+    wandb.log({
+        "final/total_steps": global_step,
+        "final/total_batches": k + 1,
+        "final/total_rollouts": total_rollouts,
+        "final/best_mean_return": best_mean_return,
+        "final/algorithm": "GRPO-Accelerate"
+    })
 
 
 if __name__ == "__main__":

@@ -267,7 +267,7 @@ def main():
     accelerator.print(f"Локальный ранг: {accelerator.local_process_index}")
     
     seed = 42
-    wandb_project = None
+    wandb_project = "grpo_accelerate_ddp"
     model_name = "unsloth/Llama-3.2-1B-Instruct"
     checkpoint_path = Path("./output")
     checkpoint_interval = 20
@@ -319,11 +319,38 @@ def main():
 
     # Инициализация wandb только на главном процессе
     if accelerator.is_main_process:
-        wandb.init(mode="disabled" if wandb_project is None else "online", project=wandb_project)
+        # Расширенная конфигурация для wandb
+        config = {
+            "model_name": model_name,
+            "learning_rate": lr,
+            "batch_size": train_batch_size,
+            "group_size": group_size,
+            "rollouts_per_step": rollouts_per_step,
+            "epochs_per_step": epochs_per_step,
+            "kl_weight": kl_weight,
+            "clip_eps": clip_eps,
+            "temperature": temperature,
+            "top_p": top_p,
+            "max_length": max_length,
+            "distributed_type": str(accelerator.distributed_type),
+            "num_processes": accelerator.num_processes,
+            "mixed_precision": str(accelerator.mixed_precision),
+            "algorithm": "GRPO-DDP"
+        }
+        if wandb_project is None:
+            wandb.init(mode="disabled")
+        else:
+            wandb.init(project=wandb_project, config=config)
+
+    global_step = 0
+    best_mean_return = float('-inf')
+    total_rollouts = 0
 
     for k, prompt_batch in enumerate(prompt_loader):
         replay_buffer.clear()
         rollout_returns = []
+        batch_advantages = []
+        batch_kl_divergences = []
 
         with torch.no_grad():
             for q, a in zip(prompt_batch["question"], prompt_batch["answer"]):
@@ -332,13 +359,17 @@ def main():
                 )
 
                 rollout_returns.append(returns.cpu())
+                total_rollouts += len(returns)
+                
                 advantages = group_advantages(returns)
+                batch_advantages.append(advantages.cpu())
                 attention_mask = sequence_ids != tokenizer.eos_token_id
 
                 log_probs = sequences_log_probs(model, sequence_ids, attention_mask, accelerator)
                 log_probs_ref = sequences_log_probs(reference_model, sequence_ids, attention_mask, accelerator)
 
                 kl = approx_kl_divergence(log_probs, log_probs_ref, action_mask)
+                batch_kl_divergences.append(kl.cpu())
 
                 replay_buffer.append(
                     Experience(
@@ -353,44 +384,195 @@ def main():
                     ).to("cpu")
                 )
 
-        # Логируем метрики только на главном процессе
-        if accelerator.is_main_process and rollout_returns:
-            episode_return_sum = torch.stack(rollout_returns).sum()
-            wandb.log({"returns": episode_return_sum})
+        # Агрегируем метрики по всем процессам
+        all_returns = torch.cat(rollout_returns)
+        episode_return_sum = all_returns.sum()
+        episode_return_mean = all_returns.mean()
+        episode_return_std = all_returns.std()
+        episode_return_max = all_returns.max()
+        episode_return_min = all_returns.min()
+        
+        # Синхронизируем метрики между процессами
+        if accelerator.num_processes > 1:
+            episode_return_mean = accelerator.gather(episode_return_mean.unsqueeze(0)).mean()
+            episode_return_sum = accelerator.gather(episode_return_sum.unsqueeze(0)).sum()
+        
+        # Обновляем лучший результат
+        if episode_return_mean > best_mean_return:
+            best_mean_return = episode_return_mean
+        
+        # KL дивергенция статистики
+        if batch_kl_divergences:
+            all_kl_values = torch.cat([kl.flatten() for kl in batch_kl_divergences])
+            batch_kl_mean = all_kl_values.mean()
+            batch_kl_std = all_kl_values.std()
+            batch_kl_max = all_kl_values.max()
+            
+            # Синхронизируем KL метрики между процессами
+            if accelerator.num_processes > 1:
+                batch_kl_mean = accelerator.gather(batch_kl_mean.unsqueeze(0)).mean()
+        else:
+            batch_kl_mean = batch_kl_std = batch_kl_max = 0.0
+
+        # Преимущества статистики
+        if batch_advantages:
+            all_advantages_values = torch.cat([adv.flatten() for adv in batch_advantages])
+            advantages_mean = all_advantages_values.mean()
+            advantages_std = all_advantages_values.std()
+            
+            # Синхронизируем метрики преимуществ между процессами
+            if accelerator.num_processes > 1:
+                advantages_mean = accelerator.gather(advantages_mean.unsqueeze(0)).mean()
+        else:
+            advantages_mean = advantages_std = 0.0
+
+        accelerator.print(f"returns of step {k}: {episode_return_sum:.4f}")
+        
+        # Логирование только на главном процессе
+        if accelerator.is_main_process:
+            wandb.log({
+                # Основные метрики возвратов
+                "rollouts/returns_sum": episode_return_sum,
+                "rollouts/returns_mean": episode_return_mean,
+                "rollouts/returns_std": episode_return_std,
+                "rollouts/returns_max": episode_return_max,
+                "rollouts/returns_min": episode_return_min,
+                "rollouts/returns_best_mean": best_mean_return,
+                
+                # KL дивергенция
+                "rollouts/kl_mean": batch_kl_mean,
+                "rollouts/kl_std": batch_kl_std,
+                "rollouts/kl_max": batch_kl_max,
+                
+                # Преимущества
+                "rollouts/advantages_mean": advantages_mean,
+                "rollouts/advantages_std": advantages_std,
+                
+                # DDP специфичные метрики
+                "ddp/num_processes": accelerator.num_processes,
+                "ddp/process_index": accelerator.process_index,
+                "ddp/local_process_index": accelerator.local_process_index,
+                
+                # Общие статистики
+                "rollouts/total_rollouts": total_rollouts,
+                "rollouts/batch_step": k + 1,
+            }, step=global_step)
 
         experience_sampler = DataLoader(
-            replay_buffer, batch_size=train_batch_size, shuffle=True, collate_fn=join_experience_batch
+            replay_buffer, batch_size=train_batch_size, shuffle=True, drop_last=True, collate_fn=join_experience_batch
         )
-        experience_sampler = accelerator.prepare(experience_sampler)
 
-        model.train()
-        for _ in range(epochs_per_step):
+        epoch_losses = []
+        epoch_kls = []
+        epoch_grad_norms = []
+
+        for step_epoch in range(epochs_per_step):
+            model.train()
             for exp in experience_sampler:
-                optimizer.zero_grad()
                 exp = exp.to(accelerator.device)
-                log_probs = sequences_log_probs(model, exp.sequences, exp.attention_mask, accelerator)
-                loss, kl = objective(log_probs=log_probs, experience=exp)
-                accelerator.backward(loss)
-                
-                if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(model.parameters(), max_norm)
+
+                with accelerator.accumulate(model):
+                    optimizer.zero_grad()
+
+                    log_probs = sequences_log_probs(model, exp.sequences, exp.attention_mask)
+                    loss, kl = objective(log_probs=log_probs, experience=exp)
+
+                    if not loss.isfinite():
+                        accelerator.print(f"Loss not finite, skipping backward, loss={loss}")
+                        if accelerator.is_main_process:
+                            wandb.log({
+                                "training/invalid_loss_count": 1,
+                                "training/loss": float('inf'),
+                                "training/kl": float('inf'),
+                            }, step=global_step)
+                        continue
+
+                    accelerator.backward(loss)
                     
-                optimizer.step()
+                    if accelerator.sync_gradients:
+                        grad_norm = accelerator.clip_grad_norm_(model.parameters(), max_norm)
+                    else:
+                        grad_norm = 0.0
+                    
+                    # Собираем метрики эпохи
+                    epoch_losses.append(loss.item())
+                    epoch_kls.append(kl.item())
+                    epoch_grad_norms.append(grad_norm if isinstance(grad_norm, float) else grad_norm.item())
+                    
+                    # Логирование на каждом шаге оптимизации (только главный процесс)
+                    if accelerator.is_main_process:
+                        wandb.log({
+                            "training_step/loss": loss.item(),
+                            "training_step/kl": kl.item(),
+                            "training_step/grad_norm": grad_norm if isinstance(grad_norm, float) else grad_norm.item(),
+                            "training_step/learning_rate": optimizer.param_groups[0]['lr'],
+                            "ddp/sync_gradients": accelerator.sync_gradients,
+                        }, step=global_step)
 
-        # Сохраняем чекпоинты только на главном процессе
-        if accelerator.is_main_process and checkpoint_path and checkpoint_interval and (k + 1) % checkpoint_interval == 0:
-            # Сохраняем состояние обучения
-            accelerator.save_state(checkpoint_path / f"step_{k}")
+                    optimizer.step()
+                    global_step += 1
+
+        # Агрегируем метрики эпохи по всем процессам
+        if epoch_losses:
+            loss_mean = sum(epoch_losses) / len(epoch_losses)
+            kl_mean = sum(epoch_kls) / len(epoch_kls)
+            grad_norm_mean = sum(epoch_grad_norms) / len(epoch_grad_norms)
             
-            # Дополнительно сохраняем модель с LoRA адаптерами
-            unwrapped_model = accelerator.unwrap_model(model)
-            unwrapped_model.save_pretrained(checkpoint_path / f"step_{k}_model")
+            # Синхронизируем метрики между процессами
+            if accelerator.num_processes > 1:
+                loss_mean = accelerator.gather(torch.tensor(loss_mean)).mean().item()
+                kl_mean = accelerator.gather(torch.tensor(kl_mean)).mean().item()
+                grad_norm_mean = accelerator.gather(torch.tensor(grad_norm_mean)).mean().item()
 
-    # Сохраняем финальную модель только на главном процессе
-    if accelerator.is_main_process and checkpoint_path:
+            # Логирование средних значений по эпохе (только главный процесс)
+            if accelerator.is_main_process:
+                wandb.log({
+                    "training_epoch/loss_mean": loss_mean,
+                    "training_epoch/loss_std": torch.tensor(epoch_losses).std().item(),
+                    "training_epoch/kl_mean": kl_mean,
+                    "training_epoch/kl_std": torch.tensor(epoch_kls).std().item(),
+                    "training_epoch/grad_norm_mean": grad_norm_mean,
+                    "training_epoch/grad_norm_max": max(epoch_grad_norms),
+                    "training_epoch/steps_per_epoch": len(epoch_losses),
+                }, step=global_step)
+
+        # Логирование информации о памяти и системе (только главный процесс)
+        if accelerator.is_main_process and torch.cuda.is_available():
+            gpu_memory_allocated = torch.cuda.memory_allocated() / 1024**3  # GB
+            gpu_memory_reserved = torch.cuda.memory_reserved() / 1024**3   # GB
+            wandb.log({
+                "system/gpu_memory_allocated_gb": gpu_memory_allocated,
+                "system/gpu_memory_reserved_gb": gpu_memory_reserved,
+                "system/replay_buffer_size": len(replay_buffer),
+            }, step=global_step)
+
+        # Сохранение чекпоинта (только главный процесс)
+        if (
+            checkpoint_path is not None
+            and checkpoint_interval is not None
+            and (k + 1) % checkpoint_interval == 0
+            and accelerator.is_main_process
+        ):
+            unwrapped_model = accelerator.unwrap_model(model)
+            unwrapped_model.save_pretrained(checkpoint_path / f"step_{k}")
+            wandb.log({
+                "checkpoint/saved": 1,
+                "checkpoint/step": k + 1
+            }, step=global_step)
+
+    # Финальное сохранение (только главный процесс)
+    if checkpoint_path is not None and accelerator.is_main_process:
         unwrapped_model = accelerator.unwrap_model(model)
-        accelerator.save_state(checkpoint_path / "final")
-        unwrapped_model.save_pretrained(checkpoint_path / "final_model")
+        unwrapped_model.save_pretrained(checkpoint_path / f"step_{k}")
+        wandb.log({
+            "checkpoint/final_saved": 1,
+            "training/completed": True,
+            "final/total_steps": global_step,
+            "final/total_batches": k + 1,
+            "final/total_rollouts": total_rollouts,
+            "final/best_mean_return": best_mean_return,
+            "final/algorithm": "GRPO-DDP"
+        }, step=global_step)
 
     # Закрываем wandb на главном процессе
     if accelerator.is_main_process and wandb.run is not None:
